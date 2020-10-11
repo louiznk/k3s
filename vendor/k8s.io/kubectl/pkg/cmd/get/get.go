@@ -22,11 +22,12 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	corev1 "k8s.io/api/core/v1"
-	kapierrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -79,7 +80,6 @@ type GetOptions struct {
 	NoHeaders      bool
 	Sort           bool
 	IgnoreNotFound bool
-	Export         bool
 
 	genericclioptions.IOStreams
 }
@@ -182,8 +182,6 @@ func NewCmdGet(parent string, f cmdutil.Factory, streams genericclioptions.IOStr
 	cmd.Flags().BoolVarP(&o.AllNamespaces, "all-namespaces", "A", o.AllNamespaces, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
 	addOpenAPIPrintColumnFlags(cmd, o)
 	addServerPrintColumnFlags(cmd, o)
-	cmd.Flags().BoolVar(&o.Export, "export", o.Export, "If true, use 'export' for the resources.  Exported resources are stripped of cluster-specific information.")
-	cmd.Flags().MarkDeprecated("export", "This flag is deprecated and will be removed in future.")
 	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, "identifying the resource to get from a server.")
 	return cmd
 }
@@ -300,7 +298,7 @@ func (o *GetOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []stri
 // Validate checks the set of flags provided by the user.
 func (o *GetOptions) Validate(cmd *cobra.Command) error {
 	if len(o.Raw) > 0 {
-		if o.Watch || o.WatchOnly || len(o.LabelSelector) > 0 || o.Export {
+		if o.Watch || o.WatchOnly || len(o.LabelSelector) > 0 {
 			return fmt.Errorf("--raw may not be specified with other flags that filter the server request or alter the output")
 		}
 		if len(cmdutil.GetFlagString(cmd, "output")) > 0 {
@@ -351,7 +349,7 @@ func (r *RuntimeSorter) Sort() error {
 		return nil
 	}
 	if len(r.objects) == 1 {
-		_, isTable := r.objects[0].(*metav1beta1.Table)
+		_, isTable := r.objects[0].(*metav1.Table)
 		if !isTable {
 			return nil
 		}
@@ -362,7 +360,7 @@ func (r *RuntimeSorter) Sort() error {
 
 	for _, obj := range r.objects {
 		switch t := obj.(type) {
-		case *metav1beta1.Table:
+		case *metav1.Table:
 			includesTable = true
 
 			if sorter, err := NewTableSorter(t, r.field); err != nil {
@@ -433,11 +431,11 @@ func (o *GetOptions) transformRequests(req *rest.Request) {
 		return
 	}
 
-	group := metav1beta1.GroupName
-	version := metav1beta1.SchemeGroupVersion.Version
-
-	tableParam := fmt.Sprintf("application/json;as=Table;v=%s;g=%s, application/json", version, group)
-	req.SetHeader("Accept", tableParam)
+	req.SetHeader("Accept", strings.Join([]string{
+		fmt.Sprintf("application/json;as=Table;v=%s;g=%s", metav1.SchemeGroupVersion.Version, metav1.GroupName),
+		fmt.Sprintf("application/json;as=Table;v=%s;g=%s", metav1beta1.SchemeGroupVersion.Version, metav1beta1.GroupName),
+		"application/json",
+	}, ","))
 
 	// if sorting, ensure we receive the full object in order to introspect its fields via jsonpath
 	if o.Sort {
@@ -472,7 +470,6 @@ func (o *GetOptions) Run(f cmdutil.Factory, cmd *cobra.Command, args []string) e
 		FilenameParam(o.ExplicitNamespace, &o.FilenameOptions).
 		LabelSelectorParam(o.LabelSelector).
 		FieldSelectorParam(o.FieldSelector).
-		ExportParam(o.Export).
 		RequestChunksOf(chunkSize).
 		ResourceTypeOrNameArgs(true, args...).
 		ContinueOnError().
@@ -482,7 +479,7 @@ func (o *GetOptions) Run(f cmdutil.Factory, cmd *cobra.Command, args []string) e
 		Do()
 
 	if o.IgnoreNotFound {
-		r.IgnoreErrors(kapierrors.IsNotFound)
+		r.IgnoreErrors(apierrors.IsNotFound)
 	}
 	if err := r.Err(); err != nil {
 		return err
@@ -528,6 +525,7 @@ func (o *GetOptions) Run(f cmdutil.Factory, cmd *cobra.Command, args []string) e
 	separatorWriter := &separatorWriterWrapper{Delegate: trackingWriter}
 
 	w := printers.GetNewTabWriter(separatorWriter)
+	allResourcesNamespaced := !o.AllNamespaces
 	for ix := range objs {
 		var mapping *meta.RESTMapping
 		var info *resource.Info
@@ -539,6 +537,7 @@ func (o *GetOptions) Run(f cmdutil.Factory, cmd *cobra.Command, args []string) e
 			mapping = info.Mapping
 		}
 
+		allResourcesNamespaced = allResourcesNamespaced && info.Namespaced()
 		printWithNamespace := o.AllNamespaces
 
 		if mapping != nil && mapping.Scope.Name() == meta.RESTScopeNameRoot {
@@ -582,7 +581,7 @@ func (o *GetOptions) Run(f cmdutil.Factory, cmd *cobra.Command, args []string) e
 	w.Flush()
 	if trackingWriter.Written == 0 && !o.IgnoreNotFound && len(allErrs) == 0 {
 		// if we wrote no output, and had no errors, and are not ignoring NotFound, be sure we output something
-		if !o.AllNamespaces {
+		if allResourcesNamespaced {
 			fmt.Fprintln(o.ErrOut, fmt.Sprintf("No resources found in %s namespace.", o.Namespace))
 		} else {
 			fmt.Fprintln(o.ErrOut, fmt.Sprintf("No resources found"))
@@ -629,7 +628,6 @@ func (o *GetOptions) watch(f cmdutil.Factory, cmd *cobra.Command, args []string)
 		FilenameParam(o.ExplicitNamespace, &o.FilenameOptions).
 		LabelSelectorParam(o.LabelSelector).
 		FieldSelectorParam(o.FieldSelector).
-		ExportParam(o.Export).
 		RequestChunksOf(o.ChunkSize).
 		ResourceTypeOrNameArgs(true, args...).
 		SingleResourceType().

@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/rancher/k3s/pkg/agent/proxy"
 	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/rancher/remotedialer"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
@@ -50,7 +52,7 @@ func getAddresses(endpoint *v1.Endpoints) []string {
 	return serverAddresses
 }
 
-func Setup(ctx context.Context, config *config.Node, onChange func([]string)) error {
+func Setup(ctx context.Context, config *config.Node, proxy proxy.Proxy) error {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", config.AgentConfig.KubeConfigK3sController)
 	if err != nil {
 		return err
@@ -71,20 +73,15 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 		return err
 	}
 
-	addresses := []string{config.ServerAddress}
-
-	endpoint, _ := client.CoreV1().Endpoints("default").Get("kubernetes", metav1.GetOptions{})
+	endpoint, _ := client.CoreV1().Endpoints("default").Get(ctx, "kubernetes", metav1.GetOptions{})
 	if endpoint != nil {
-		addresses = getAddresses(endpoint)
-		if onChange != nil {
-			onChange(addresses)
-		}
+		proxy.Update(getAddresses(endpoint))
 	}
 
 	disconnect := map[string]context.CancelFunc{}
 
 	wg := &sync.WaitGroup{}
-	for _, address := range addresses {
+	for _, address := range proxy.SupervisorAddresses() {
 		if _, ok := disconnect[address]; !ok {
 			disconnect[address] = connect(ctx, wg, address, tlsConfig)
 		}
@@ -94,12 +91,12 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 	connect:
 		for {
 			time.Sleep(5 * time.Second)
-			watch, err := client.CoreV1().Endpoints("default").Watch(metav1.ListOptions{
+			watch, err := client.CoreV1().Endpoints("default").Watch(ctx, metav1.ListOptions{
 				FieldSelector:   fields.Set{"metadata.name": "kubernetes"}.String(),
 				ResourceVersion: "0",
 			})
 			if err != nil {
-				logrus.Errorf("Unable to watch for tunnel endpoints: %v", err)
+				logrus.Warnf("Unable to watch for tunnel endpoints: %v", err)
 				continue connect
 			}
 		watching:
@@ -120,18 +117,14 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 					}
 
 					newAddresses := getAddresses(endpoint)
-					if reflect.DeepEqual(newAddresses, addresses) {
+					if reflect.DeepEqual(newAddresses, proxy.SupervisorAddresses()) {
 						continue watching
 					}
-					addresses = newAddresses
-					logrus.Infof("Tunnel endpoint watch event: %v", addresses)
-					if onChange != nil {
-						onChange(addresses)
-					}
+					proxy.Update(newAddresses)
 
 					validEndpoint := map[string]bool{}
 
-					for _, address := range addresses {
+					for _, address := range proxy.SupervisorAddresses() {
 						validEndpoint[address] = true
 						if _, ok := disconnect[address]; !ok {
 							disconnect[address] = connect(ctx, nil, address, tlsConfig)
@@ -158,7 +151,7 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 
 	select {
 	case <-ctx.Done():
-		logrus.Error("tunnel context canceled while waiting for connection")
+		logrus.Error("Tunnel context canceled while waiting for connection")
 		return ctx.Err()
 	case <-wait:
 	}
@@ -167,7 +160,7 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 }
 
 func connect(rootCtx context.Context, waitGroup *sync.WaitGroup, address string, tlsConfig *tls.Config) context.CancelFunc {
-	wsURL := fmt.Sprintf("wss://%s/v1-k3s/connect", address)
+	wsURL := fmt.Sprintf("wss://%s/v1-"+version.Program+"/connect", address)
 	ws := &websocket.Dialer{
 		TLSClientConfig: tlsConfig,
 	}

@@ -1,22 +1,36 @@
 package cmds
 
 import (
-	"fmt"
+	"context"
 
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/urfave/cli"
 )
 
+const (
+	DisableItems = "coredns, servicelb, traefik, local-storage, metrics-server"
+
+	defaultSnapshotRentention    = 5
+	defaultSnapshotIntervalHours = 12
+)
+
 type Server struct {
-	ClusterCIDR              string
-	AgentToken               string
-	AgentTokenFile           string
-	Token                    string
-	TokenFile                string
-	ClusterSecret            string
-	ServiceCIDR              string
-	ClusterDNS               string
-	ClusterDomain            string
-	HTTPSPort                int
+	ClusterCIDR    string
+	AgentToken     string
+	AgentTokenFile string
+	Token          string
+	TokenFile      string
+	ClusterSecret  string
+	ServiceCIDR    string
+	ClusterDNS     string
+	ClusterDomain  string
+	// The port which kubectl clients can access k8s
+	HTTPSPort int
+	// The port which custom k3s API runs on
+	SupervisorPort int
+	// The port which kube-apiserver runs on
+	APIServerPort            int
+	APIServerBindAddress     string
 	DataDir                  string
 	DisableAgent             bool
 	KubeConfigOutput         string
@@ -40,9 +54,16 @@ type Server struct {
 	DefaultLocalStoragePath  string
 	DisableCCM               bool
 	DisableNPC               bool
+	DisableKubeProxy         bool
 	ClusterInit              bool
 	ClusterReset             bool
+	ClusterResetRestorePath  string
 	EncryptSecrets           bool
+	StartupHooks             []func(context.Context, <-chan struct{}, string) error
+	EtcdDisableSnapshots     bool
+	EtcdSnapshotDir          string
+	EtcdSnapshotCron         string
+	EtcdSnapshotRetention    int
 }
 
 var ServerConfig Server
@@ -52,15 +73,18 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 		Name:      "server",
 		Usage:     "Run management server",
 		UsageText: appName + " server [OPTIONS]",
+		Before:    SetupDebug(CheckSELinuxFlags),
 		Action:    action,
 		Flags: []cli.Flag{
+			ConfigFlag,
+			DebugFlag,
 			VLevel,
 			VModule,
 			LogFile,
 			AlsoLogToStderr,
 			cli.StringFlag{
 				Name:        "bind-address",
-				Usage:       "(listener) k3s bind address (default: 0.0.0.0)",
+				Usage:       "(listener) " + version.Program + " bind address (default: 0.0.0.0)",
 				Destination: &ServerConfig.BindAddress,
 			},
 			cli.IntFlag{
@@ -86,7 +110,7 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			},
 			cli.StringFlag{
 				Name:        "data-dir,d",
-				Usage:       "(data) Folder to hold state default /var/lib/rancher/k3s or ${HOME}/.rancher/k3s if not root",
+				Usage:       "(data) Folder to hold state default /var/lib/rancher/" + version.Program + " or ${HOME}/.rancher/" + version.Program + " if not root",
 				Destination: &ServerConfig.DataDir,
 			},
 			cli.StringFlag{
@@ -115,7 +139,7 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			},
 			cli.StringFlag{
 				Name:        "flannel-backend",
-				Usage:       fmt.Sprintf("(networking) One of 'none', 'vxlan', 'ipsec', 'host-gw', or 'wireguard'"),
+				Usage:       "(networking) One of 'none', 'vxlan', 'ipsec', 'host-gw', or 'wireguard'",
 				Destination: &ServerConfig.FlannelBackend,
 				Value:       "vxlan",
 			},
@@ -123,25 +147,25 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 				Name:        "token,t",
 				Usage:       "(cluster) Shared secret used to join a server or agent to a cluster",
 				Destination: &ServerConfig.Token,
-				EnvVar:      "K3S_TOKEN",
+				EnvVar:      version.ProgramUpper + "_TOKEN",
 			},
 			cli.StringFlag{
 				Name:        "token-file",
 				Usage:       "(cluster) File containing the cluster-secret/token",
 				Destination: &ServerConfig.TokenFile,
-				EnvVar:      "K3S_TOKEN_FILE",
+				EnvVar:      version.ProgramUpper + "_TOKEN_FILE",
 			},
 			cli.StringFlag{
 				Name:        "write-kubeconfig,o",
 				Usage:       "(client) Write kubeconfig for admin client to this file",
 				Destination: &ServerConfig.KubeConfigOutput,
-				EnvVar:      "K3S_KUBECONFIG_OUTPUT",
+				EnvVar:      version.ProgramUpper + "_KUBECONFIG_OUTPUT",
 			},
 			cli.StringFlag{
 				Name:        "write-kubeconfig-mode",
 				Usage:       "(client) Write kubeconfig with this mode",
 				Destination: &ServerConfig.KubeConfigMode,
-				EnvVar:      "K3S_KUBECONFIG_MODE",
+				EnvVar:      version.ProgramUpper + "_KUBECONFIG_MODE",
 			},
 			cli.StringSliceFlag{
 				Name:  "kube-apiserver-arg",
@@ -167,25 +191,47 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 				Name:        "datastore-endpoint",
 				Usage:       "(db) Specify etcd, Mysql, Postgres, or Sqlite (default) data source name",
 				Destination: &ServerConfig.DatastoreEndpoint,
-				EnvVar:      "K3S_DATASTORE_ENDPOINT",
+				EnvVar:      version.ProgramUpper + "_DATASTORE_ENDPOINT",
 			},
 			cli.StringFlag{
 				Name:        "datastore-cafile",
 				Usage:       "(db) TLS Certificate Authority file used to secure datastore backend communication",
 				Destination: &ServerConfig.DatastoreCAFile,
-				EnvVar:      "K3S_DATASTORE_CAFILE",
+				EnvVar:      version.ProgramUpper + "_DATASTORE_CAFILE",
 			},
 			cli.StringFlag{
 				Name:        "datastore-certfile",
 				Usage:       "(db) TLS certification file used to secure datastore backend communication",
 				Destination: &ServerConfig.DatastoreCertFile,
-				EnvVar:      "K3S_DATASTORE_CERTFILE",
+				EnvVar:      version.ProgramUpper + "_DATASTORE_CERTFILE",
 			},
 			cli.StringFlag{
 				Name:        "datastore-keyfile",
 				Usage:       "(db) TLS key file used to secure datastore backend communication",
 				Destination: &ServerConfig.DatastoreKeyFile,
-				EnvVar:      "K3S_DATASTORE_KEYFILE",
+				EnvVar:      version.ProgramUpper + "_DATASTORE_KEYFILE",
+			},
+			&cli.BoolFlag{
+				Name:        "etcd-disable-snapshots",
+				Usage:       "(db) Disable automatic etcd snapshots",
+				Destination: &ServerConfig.EtcdDisableSnapshots,
+			},
+			&cli.StringFlag{
+				Name:        "etcd-snapshot-schedule-cron",
+				Usage:       "(db) Snapshot interval time in cron spec. eg. every 5 hours '* */5 * * *'",
+				Destination: &ServerConfig.EtcdSnapshotCron,
+				Value:       "0 */12 * * *",
+			},
+			&cli.IntFlag{
+				Name:        "etcd-snapshot-retention",
+				Usage:       "(db) Number of snapshots to retain",
+				Destination: &ServerConfig.EtcdSnapshotRetention,
+				Value:       defaultSnapshotRentention,
+			},
+			&cli.StringFlag{
+				Name:        "etcd-snapshot-dir",
+				Usage:       "(db) Directory to save db snapshots. (Default location: ${data-dir}/db/snapshots)",
+				Destination: &ServerConfig.EtcdSnapshotDir,
 			},
 			cli.StringFlag{
 				Name:        "default-local-storage-path",
@@ -194,7 +240,7 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			},
 			cli.StringSliceFlag{
 				Name:  "disable",
-				Usage: "(components) Do not deploy packaged components and delete any deployed components (valid items: coredns, servicelb, traefik, local-storage, metrics-server)",
+				Usage: "(components) Do not deploy packaged components and delete any deployed components (valid items: " + DisableItems + ")",
 			},
 			cli.BoolFlag{
 				Name:        "disable-scheduler",
@@ -203,12 +249,17 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			},
 			cli.BoolFlag{
 				Name:        "disable-cloud-controller",
-				Usage:       "(components) Disable k3s default cloud controller manager",
+				Usage:       "(components) Disable " + version.Program + " default cloud controller manager",
 				Destination: &ServerConfig.DisableCCM,
 			},
 			cli.BoolFlag{
+				Name:        "disable-kube-proxy",
+				Usage:       "(components) Disable running kube-proxy",
+				Destination: &ServerConfig.DisableKubeProxy,
+			},
+			cli.BoolFlag{
 				Name:        "disable-network-policy",
-				Usage:       "(components) Disable k3s default network policy controller",
+				Usage:       "(components) Disable " + version.Program + " default network policy controller",
 				Destination: &ServerConfig.DisableNPC,
 			},
 			NodeNameFlag,
@@ -216,9 +267,9 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			NodeLabels,
 			NodeTaints,
 			DockerFlag,
-			DisableSELinuxFlag,
 			CRIEndpointFlag,
 			PauseImageFlag,
+			SnapshotterFlag,
 			PrivateRegistryFlag,
 			NodeIPFlag,
 			NodeExternalIPFlag,
@@ -227,6 +278,7 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			FlannelConfFlag,
 			ExtraKubeletArgs,
 			ExtraKubeProxyArgs,
+			ProtectKernelDefaultsFlag,
 			cli.BoolFlag{
 				Name:        "rootless",
 				Usage:       "(experimental) Run rootless",
@@ -236,52 +288,60 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 				Name:        "agent-token",
 				Usage:       "(experimental/cluster) Shared secret used to join agents to the cluster, but not servers",
 				Destination: &ServerConfig.AgentToken,
-				EnvVar:      "K3S_AGENT_TOKEN",
+				EnvVar:      version.ProgramUpper + "_AGENT_TOKEN",
 			},
 			cli.StringFlag{
 				Name:        "agent-token-file",
 				Usage:       "(experimental/cluster) File containing the agent secret",
 				Destination: &ServerConfig.AgentTokenFile,
-				EnvVar:      "K3S_AGENT_TOKEN_FILE",
+				EnvVar:      version.ProgramUpper + "_AGENT_TOKEN_FILE",
 			},
 			cli.StringFlag{
 				Name:        "server,s",
+				Hidden:      hideClusterFlags,
 				Usage:       "(experimental/cluster) Server to connect to, used to join a cluster",
-				EnvVar:      "K3S_URL",
+				EnvVar:      version.ProgramUpper + "_URL",
 				Destination: &ServerConfig.ServerURL,
 			},
 			cli.BoolFlag{
 				Name:        "cluster-init",
-				Hidden:      hideDqlite,
-				Usage:       "(experimental/cluster) Initialize new cluster master",
-				EnvVar:      "K3S_CLUSTER_INIT",
+				Hidden:      hideClusterFlags,
+				Usage:       "(experimental/cluster) Initialize a new cluster",
+				EnvVar:      version.ProgramUpper + "_CLUSTER_INIT",
 				Destination: &ServerConfig.ClusterInit,
 			},
 			cli.BoolFlag{
 				Name:        "cluster-reset",
-				Hidden:      hideDqlite,
-				Usage:       "(experimental/cluster) Forget all peers and become a single cluster new cluster master",
-				EnvVar:      "K3S_CLUSTER_RESET",
+				Hidden:      hideClusterFlags,
+				Usage:       "(experimental/cluster) Forget all peers and become sole member of a new cluster",
+				EnvVar:      version.ProgramUpper + "_CLUSTER_RESET",
 				Destination: &ServerConfig.ClusterReset,
+			},
+			&cli.StringFlag{
+				Name:        "cluster-reset-restore-path",
+				Usage:       "(db) Path to snapshot file to be restored",
+				Destination: &ServerConfig.ClusterResetRestorePath,
 			},
 			cli.BoolFlag{
 				Name:        "secrets-encryption",
 				Usage:       "(experimental) Enable Secret encryption at rest",
 				Destination: &ServerConfig.EncryptSecrets,
 			},
+			&SELinuxFlag,
 
 			// Hidden/Deprecated flags below
 
+			&DisableSELinuxFlag,
 			FlannelFlag,
 			cli.StringSliceFlag{
 				Name:  "no-deploy",
-				Usage: "(deprecated) Do not deploy packaged components (valid items: coredns, servicelb, traefik, local-storage, metrics-server)",
+				Usage: "(deprecated) Do not deploy packaged components (valid items: " + DisableItems + ")",
 			},
 			cli.StringFlag{
 				Name:        "cluster-secret",
 				Usage:       "(deprecated) use --token",
 				Destination: &ServerConfig.ClusterSecret,
-				EnvVar:      "K3S_CLUSTER_SECRET",
+				EnvVar:      version.ProgramUpper + "_CLUSTER_SECRET",
 			},
 			cli.BoolFlag{
 				Name:        "disable-agent",

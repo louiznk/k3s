@@ -13,40 +13,40 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
-	// registering k3s cloud provider
-	_ "github.com/rancher/k3s/pkg/cloudprovider"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/pkg/errors"
 	certutil "github.com/rancher/dynamiclistener/cert"
 	"github.com/rancher/k3s/pkg/clientaccess"
 	"github.com/rancher/k3s/pkg/cluster"
 	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/daemons/executor"
 	"github.com/rancher/k3s/pkg/passwd"
 	"github.com/rancher/k3s/pkg/token"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/rancher/wrangler-api/pkg/generated/controllers/rbac"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	_ "k8s.io/component-base/metrics/prometheus/restclient" // for client metric registration
 	ccmapp "k8s.io/kubernetes/cmd/cloud-controller-manager/app"
 	app2 "k8s.io/kubernetes/cmd/controller-manager/app"
-	"k8s.io/kubernetes/cmd/kube-apiserver/app"
-	cmapp "k8s.io/kubernetes/cmd/kube-controller-manager/app"
-	sapp "k8s.io/kubernetes/cmd/kube-scheduler/app"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 	"k8s.io/kubernetes/pkg/master"
 	"k8s.io/kubernetes/pkg/proxy/util"
+
+	// registering k3s cloud provider
+	_ "github.com/rancher/k3s/pkg/cloudprovider"
+	// for client metric registration
+	_ "k8s.io/component-base/metrics/prometheus/restclient"
 )
 
 var (
@@ -76,7 +76,6 @@ users:
 )
 
 const (
-	userTokenSize  = 8
 	ipsecTokenSize = 48
 	aescbcKeySize  = 32
 )
@@ -99,18 +98,27 @@ func Server(ctx context.Context, cfg *config.Control) error {
 		return err
 	}
 
-	if err := waitForAPIServer(ctx, runtime); err != nil {
+	if err := waitForAPIServerInBackground(ctx, runtime); err != nil {
 		return err
 	}
 
-	runtime.Handler = handler
-	runtime.Authenticator = auth
-
-	if !cfg.NoScheduler {
-		scheduler(cfg, runtime)
+	basicAuth, err := basicAuthenticator(runtime.PasswdFile)
+	if err != nil {
+		return err
 	}
 
-	controllerManager(cfg, runtime)
+	runtime.Authenticator = combineAuthenticators(basicAuth, auth)
+	runtime.Handler = handler
+
+	if !cfg.NoScheduler {
+		if err := scheduler(cfg, runtime); err != nil {
+			return err
+		}
+	}
+
+	if err := controllerManager(cfg, runtime); err != nil {
+		return err
+	}
 
 	if !cfg.DisableCCM {
 		cloudControllerManager(ctx, cfg, runtime)
@@ -119,7 +127,7 @@ func Server(ctx context.Context, cfg *config.Control) error {
 	return nil
 }
 
-func controllerManager(cfg *config.Control, runtime *config.ControlRuntime) {
+func controllerManager(cfg *config.Control, runtime *config.ControlRuntime) error {
 	argsMap := map[string]string{
 		"kubeconfig":                       runtime.KubeConfigController,
 		"service-account-private-key-file": runtime.ServiceKey,
@@ -127,46 +135,40 @@ func controllerManager(cfg *config.Control, runtime *config.ControlRuntime) {
 		"cluster-cidr":                     cfg.ClusterIPRange.String(),
 		"root-ca-file":                     runtime.ServerCA,
 		"port":                             "10252",
+		"profiling":                        "false",
+		"address":                          localhostIP.String(),
 		"bind-address":                     localhostIP.String(),
 		"secure-port":                      "0",
 		"use-service-account-credentials":  "true",
-		"cluster-signing-cert-file":        runtime.ServerCA,
-		"cluster-signing-key-file":         runtime.ServerCAKey,
+		"cluster-signing-cert-file":        runtime.ClientCA,
+		"cluster-signing-key-file":         runtime.ClientCAKey,
 	}
 	if cfg.NoLeaderElect {
 		argsMap["leader-elect"] = "false"
 	}
 
 	args := config.GetArgsList(argsMap, cfg.ExtraControllerArgs)
+	logrus.Infof("Running kube-controller-manager %s", config.ArgString(args))
 
-	command := cmapp.NewControllerManagerCommand()
-	command.SetArgs(args)
-
-	go func() {
-		logrus.Infof("Running kube-controller-manager %s", config.ArgString(args))
-		logrus.Fatalf("controller-manager exited: %v", command.Execute())
-	}()
+	return executor.ControllerManager(runtime.APIServerReady, args)
 }
 
-func scheduler(cfg *config.Control, runtime *config.ControlRuntime) {
+func scheduler(cfg *config.Control, runtime *config.ControlRuntime) error {
 	argsMap := map[string]string{
 		"kubeconfig":   runtime.KubeConfigScheduler,
 		"port":         "10251",
+		"address":      "127.0.0.1",
 		"bind-address": "127.0.0.1",
 		"secure-port":  "0",
+		"profiling":    "false",
 	}
 	if cfg.NoLeaderElect {
 		argsMap["leader-elect"] = "false"
 	}
 	args := config.GetArgsList(argsMap, cfg.ExtraSchedulerAPIArgs)
 
-	command := sapp.NewSchedulerCommand()
-	command.SetArgs(args)
-
-	go func() {
-		logrus.Infof("Running kube-scheduler %s", config.ArgString(args))
-		logrus.Fatalf("scheduler exited: %v", command.Execute())
-	}()
+	logrus.Infof("Running kube-scheduler %s", config.ArgString(args))
+	return executor.Scheduler(runtime.APIServerReady, args)
 }
 
 func apiServer(ctx context.Context, cfg *config.Control, runtime *config.ControlRuntime) (authenticator.Request, http.Handler, error) {
@@ -174,7 +176,7 @@ func apiServer(ctx context.Context, cfg *config.Control, runtime *config.Control
 
 	setupStorageBackend(argsMap, cfg)
 
-	certDir := filepath.Join(cfg.DataDir, "tls/temporary-certs")
+	certDir := filepath.Join(cfg.DataDir, "tls", "temporary-certs")
 	os.MkdirAll(certDir, 0700)
 
 	argsMap["cert-dir"] = certDir
@@ -187,14 +189,17 @@ func apiServer(ctx context.Context, cfg *config.Control, runtime *config.Control
 		argsMap["advertise-address"] = cfg.AdvertiseIP
 	}
 	argsMap["insecure-port"] = "0"
-	argsMap["secure-port"] = strconv.Itoa(cfg.ListenPort)
-	argsMap["bind-address"] = localhostIP.String()
+	argsMap["secure-port"] = strconv.Itoa(cfg.APIServerPort)
+	if cfg.APIServerBindAddress == "" {
+		argsMap["bind-address"] = localhostIP.String()
+	} else {
+		argsMap["bind-address"] = cfg.APIServerBindAddress
+	}
 	argsMap["tls-cert-file"] = runtime.ServingKubeAPICert
 	argsMap["tls-private-key-file"] = runtime.ServingKubeAPIKey
 	argsMap["service-account-key-file"] = runtime.ServiceKey
-	argsMap["service-account-issuer"] = "k3s"
+	argsMap["service-account-issuer"] = version.Program
 	argsMap["api-audiences"] = "unknown"
-	argsMap["basic-auth-file"] = runtime.PasswdFile
 	argsMap["kubelet-certificate-authority"] = runtime.ServerCA
 	argsMap["kubelet-client-certificate"] = runtime.ClientKubeAPICert
 	argsMap["kubelet-client-key"] = runtime.ClientKubeAPIKey
@@ -208,22 +213,14 @@ func apiServer(ctx context.Context, cfg *config.Control, runtime *config.Control
 	argsMap["client-ca-file"] = runtime.ClientCA
 	argsMap["enable-admission-plugins"] = "NodeRestriction"
 	argsMap["anonymous-auth"] = "false"
+	argsMap["profiling"] = "false"
 	if cfg.EncryptSecrets {
 		argsMap["encryption-provider-config"] = runtime.EncryptionConfig
 	}
 	args := config.GetArgsList(argsMap, cfg.ExtraAPIArgs)
 
-	command := app.NewAPIServerCommand(ctx.Done())
-	command.SetArgs(args)
-
-	go func() {
-		logrus.Infof("Running kube-apiserver %s", config.ArgString(args))
-		logrus.Fatalf("apiserver exited: %v", command.Execute())
-	}()
-
-	startupConfig := <-app.StartupConfig
-
-	return startupConfig.Authenticator, startupConfig.Handler, nil
+	logrus.Infof("Running kube-apiserver %s", config.ArgString(args))
+	return executor.APIServer(ctx, runtime.ETCDReady, args)
 }
 
 func defaults(config *config.Control) {
@@ -245,11 +242,11 @@ func defaults(config *config.Control) {
 		config.AdvertisePort = config.HTTPSPort
 	}
 
-	if config.ListenPort == 0 {
+	if config.APIServerPort == 0 {
 		if config.HTTPSPort != 0 {
-			config.ListenPort = config.HTTPSPort + 1
+			config.APIServerPort = config.HTTPSPort + 1
 		} else {
-			config.ListenPort = 6444
+			config.APIServerPort = 6444
 		}
 	}
 
@@ -272,58 +269,69 @@ func prepare(ctx context.Context, config *config.Control, runtime *config.Contro
 		return err
 	}
 
-	os.MkdirAll(path.Join(config.DataDir, "tls"), 0700)
-	os.MkdirAll(path.Join(config.DataDir, "cred"), 0700)
+	os.MkdirAll(filepath.Join(config.DataDir, "tls"), 0700)
+	os.MkdirAll(filepath.Join(config.DataDir, "cred"), 0700)
 
-	runtime.ClientCA = path.Join(config.DataDir, "tls", "client-ca.crt")
-	runtime.ClientCAKey = path.Join(config.DataDir, "tls", "client-ca.key")
-	runtime.ServerCA = path.Join(config.DataDir, "tls", "server-ca.crt")
-	runtime.ServerCAKey = path.Join(config.DataDir, "tls", "server-ca.key")
-	runtime.RequestHeaderCA = path.Join(config.DataDir, "tls", "request-header-ca.crt")
-	runtime.RequestHeaderCAKey = path.Join(config.DataDir, "tls", "request-header-ca.key")
-	runtime.IPSECKey = path.Join(config.DataDir, "cred", "ipsec.psk")
+	runtime.ClientCA = filepath.Join(config.DataDir, "tls", "client-ca.crt")
+	runtime.ClientCAKey = filepath.Join(config.DataDir, "tls", "client-ca.key")
+	runtime.ServerCA = filepath.Join(config.DataDir, "tls", "server-ca.crt")
+	runtime.ServerCAKey = filepath.Join(config.DataDir, "tls", "server-ca.key")
+	runtime.RequestHeaderCA = filepath.Join(config.DataDir, "tls", "request-header-ca.crt")
+	runtime.RequestHeaderCAKey = filepath.Join(config.DataDir, "tls", "request-header-ca.key")
+	runtime.IPSECKey = filepath.Join(config.DataDir, "cred", "ipsec.psk")
 
-	runtime.ServiceKey = path.Join(config.DataDir, "tls", "service.key")
-	runtime.PasswdFile = path.Join(config.DataDir, "cred", "passwd")
-	runtime.NodePasswdFile = path.Join(config.DataDir, "cred", "node-passwd")
+	runtime.ServiceKey = filepath.Join(config.DataDir, "tls", "service.key")
+	runtime.PasswdFile = filepath.Join(config.DataDir, "cred", "passwd")
+	runtime.NodePasswdFile = filepath.Join(config.DataDir, "cred", "node-passwd")
 
-	runtime.KubeConfigAdmin = path.Join(config.DataDir, "cred", "admin.kubeconfig")
-	runtime.KubeConfigController = path.Join(config.DataDir, "cred", "controller.kubeconfig")
-	runtime.KubeConfigScheduler = path.Join(config.DataDir, "cred", "scheduler.kubeconfig")
-	runtime.KubeConfigAPIServer = path.Join(config.DataDir, "cred", "api-server.kubeconfig")
-	runtime.KubeConfigCloudController = path.Join(config.DataDir, "cred", "cloud-controller.kubeconfig")
+	runtime.KubeConfigAdmin = filepath.Join(config.DataDir, "cred", "admin.kubeconfig")
+	runtime.KubeConfigController = filepath.Join(config.DataDir, "cred", "controller.kubeconfig")
+	runtime.KubeConfigScheduler = filepath.Join(config.DataDir, "cred", "scheduler.kubeconfig")
+	runtime.KubeConfigAPIServer = filepath.Join(config.DataDir, "cred", "api-server.kubeconfig")
+	runtime.KubeConfigCloudController = filepath.Join(config.DataDir, "cred", "cloud-controller.kubeconfig")
 
-	runtime.ClientAdminCert = path.Join(config.DataDir, "tls", "client-admin.crt")
-	runtime.ClientAdminKey = path.Join(config.DataDir, "tls", "client-admin.key")
-	runtime.ClientControllerCert = path.Join(config.DataDir, "tls", "client-controller.crt")
-	runtime.ClientControllerKey = path.Join(config.DataDir, "tls", "client-controller.key")
-	runtime.ClientCloudControllerCert = path.Join(config.DataDir, "tls", "client-cloud-controller.crt")
-	runtime.ClientCloudControllerKey = path.Join(config.DataDir, "tls", "client-cloud-controller.key")
-	runtime.ClientSchedulerCert = path.Join(config.DataDir, "tls", "client-scheduler.crt")
-	runtime.ClientSchedulerKey = path.Join(config.DataDir, "tls", "client-scheduler.key")
-	runtime.ClientKubeAPICert = path.Join(config.DataDir, "tls", "client-kube-apiserver.crt")
-	runtime.ClientKubeAPIKey = path.Join(config.DataDir, "tls", "client-kube-apiserver.key")
-	runtime.ClientKubeProxyCert = path.Join(config.DataDir, "tls", "client-kube-proxy.crt")
-	runtime.ClientKubeProxyKey = path.Join(config.DataDir, "tls", "client-kube-proxy.key")
-	runtime.ClientK3sControllerCert = path.Join(config.DataDir, "tls", "client-k3s-controller.crt")
-	runtime.ClientK3sControllerKey = path.Join(config.DataDir, "tls", "client-k3s-controller.key")
+	runtime.ClientAdminCert = filepath.Join(config.DataDir, "tls", "client-admin.crt")
+	runtime.ClientAdminKey = filepath.Join(config.DataDir, "tls", "client-admin.key")
+	runtime.ClientControllerCert = filepath.Join(config.DataDir, "tls", "client-controller.crt")
+	runtime.ClientControllerKey = filepath.Join(config.DataDir, "tls", "client-controller.key")
+	runtime.ClientCloudControllerCert = filepath.Join(config.DataDir, "tls", "client-cloud-controller.crt")
+	runtime.ClientCloudControllerKey = filepath.Join(config.DataDir, "tls", "client-cloud-controller.key")
+	runtime.ClientSchedulerCert = filepath.Join(config.DataDir, "tls", "client-scheduler.crt")
+	runtime.ClientSchedulerKey = filepath.Join(config.DataDir, "tls", "client-scheduler.key")
+	runtime.ClientKubeAPICert = filepath.Join(config.DataDir, "tls", "client-kube-apiserver.crt")
+	runtime.ClientKubeAPIKey = filepath.Join(config.DataDir, "tls", "client-kube-apiserver.key")
+	runtime.ClientKubeProxyCert = filepath.Join(config.DataDir, "tls", "client-kube-proxy.crt")
+	runtime.ClientKubeProxyKey = filepath.Join(config.DataDir, "tls", "client-kube-proxy.key")
+	runtime.ClientK3sControllerCert = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-controller.crt")
+	runtime.ClientK3sControllerKey = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-controller.key")
 
-	runtime.ServingKubeAPICert = path.Join(config.DataDir, "tls", "serving-kube-apiserver.crt")
-	runtime.ServingKubeAPIKey = path.Join(config.DataDir, "tls", "serving-kube-apiserver.key")
+	runtime.ServingKubeAPICert = filepath.Join(config.DataDir, "tls", "serving-kube-apiserver.crt")
+	runtime.ServingKubeAPIKey = filepath.Join(config.DataDir, "tls", "serving-kube-apiserver.key")
 
-	runtime.ClientKubeletKey = path.Join(config.DataDir, "tls", "client-kubelet.key")
-	runtime.ServingKubeletKey = path.Join(config.DataDir, "tls", "serving-kubelet.key")
+	runtime.ClientKubeletKey = filepath.Join(config.DataDir, "tls", "client-kubelet.key")
+	runtime.ServingKubeletKey = filepath.Join(config.DataDir, "tls", "serving-kubelet.key")
 
-	runtime.ClientAuthProxyCert = path.Join(config.DataDir, "tls", "client-auth-proxy.crt")
-	runtime.ClientAuthProxyKey = path.Join(config.DataDir, "tls", "client-auth-proxy.key")
+	runtime.ClientAuthProxyCert = filepath.Join(config.DataDir, "tls", "client-auth-proxy.crt")
+	runtime.ClientAuthProxyKey = filepath.Join(config.DataDir, "tls", "client-auth-proxy.key")
+
+	runtime.ETCDServerCA = filepath.Join(config.DataDir, "tls", "etcd", "server-ca.crt")
+	runtime.ETCDServerCAKey = filepath.Join(config.DataDir, "tls", "etcd", "server-ca.key")
+	runtime.ETCDPeerCA = filepath.Join(config.DataDir, "tls", "etcd", "peer-ca.crt")
+	runtime.ETCDPeerCAKey = filepath.Join(config.DataDir, "tls", "etcd", "peer-ca.key")
+	runtime.ServerETCDCert = filepath.Join(config.DataDir, "tls", "etcd", "server-client.crt")
+	runtime.ServerETCDKey = filepath.Join(config.DataDir, "tls", "etcd", "server-client.key")
+	runtime.PeerServerClientETCDCert = filepath.Join(config.DataDir, "tls", "etcd", "peer-server-client.crt")
+	runtime.PeerServerClientETCDKey = filepath.Join(config.DataDir, "tls", "etcd", "peer-server-client.key")
+	runtime.ClientETCDCert = filepath.Join(config.DataDir, "tls", "etcd", "client.crt")
+	runtime.ClientETCDKey = filepath.Join(config.DataDir, "tls", "etcd", "client.key")
 
 	if config.EncryptSecrets {
-		runtime.EncryptionConfig = path.Join(config.DataDir, "cred", "encryption-config.json")
+		runtime.EncryptionConfig = filepath.Join(config.DataDir, "cred", "encryption-config.json")
 	}
 
 	cluster := cluster.New(config)
 
-	if err := cluster.Join(ctx); err != nil {
+	if err := cluster.Bootstrap(ctx); err != nil {
 		return err
 	}
 
@@ -351,7 +359,13 @@ func prepare(ctx context.Context, config *config.Control, runtime *config.Contro
 		return err
 	}
 
-	return cluster.Start(ctx)
+	ready, err := cluster.Start(ctx)
+	if err != nil {
+		return err
+	}
+
+	runtime.ETCDReady = ready
+	return nil
 }
 
 func readTokens(runtime *config.ControlRuntime) error {
@@ -365,9 +379,6 @@ func readTokens(runtime *config.ControlRuntime) error {
 	}
 	if serverToken, ok := tokens.Pass("server"); ok {
 		runtime.ServerToken = "server:" + serverToken
-	}
-	if clientToken, ok := tokens.Pass("admin"); ok {
-		runtime.ClientToken = "admin:" + clientToken
 	}
 
 	return nil
@@ -400,7 +411,7 @@ func migratePassword(p *passwd.Passwd) error {
 	server, _ := p.Pass("server")
 	node, _ := p.Pass("node")
 	if server == "" && node != "" {
-		return p.EnsureUser("server", "k3s:server", node)
+		return p.EnsureUser("server", version.Program+":server", node)
 	}
 	return nil
 }
@@ -451,15 +462,11 @@ func genUsers(config *config.Control, runtime *config.ControlRuntime) error {
 
 	nodePass := getNodePass(config, serverPass)
 
-	if err := passwd.EnsureUser("admin", "system:masters", ""); err != nil {
+	if err := passwd.EnsureUser("node", version.Program+":agent", nodePass); err != nil {
 		return err
 	}
 
-	if err := passwd.EnsureUser("node", "k3s:agent", nodePass); err != nil {
-		return err
-	}
-
-	if err := passwd.EnsureUser("server", "k3s:server", serverPass); err != nil {
+	if err := passwd.EnsureUser("server", version.Program+":server", serverPass); err != nil {
 		return err
 	}
 
@@ -476,6 +483,9 @@ func genCerts(config *config.Control, runtime *config.ControlRuntime) error {
 	if err := genRequestHeaderCerts(config, runtime); err != nil {
 		return err
 	}
+	if err := genETCDCerts(config, runtime); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -488,7 +498,7 @@ func getSigningCertFactory(regen bool, altNames *certutil.AltNames, extKeyUsage 
 }
 
 func genClientCerts(config *config.Control, runtime *config.ControlRuntime) error {
-	regen, err := createSigningCertKey("k3s-client", runtime.ClientCA, runtime.ClientCAKey)
+	regen, err := createSigningCertKey(version.Program+"-client", runtime.ClientCA, runtime.ClientCAKey)
 	if err != nil {
 		return err
 	}
@@ -496,7 +506,7 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 	factory := getSigningCertFactory(regen, nil, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, runtime.ClientCA, runtime.ClientCAKey)
 
 	var certGen bool
-	apiEndpoint := fmt.Sprintf("https://127.0.0.1:%d", config.ListenPort)
+	apiEndpoint := fmt.Sprintf("https://127.0.0.1:%d", config.APIServerPort)
 
 	certGen, err = factory("system:admin", []string{"system:masters"}, runtime.ClientAdminCert, runtime.ClientAdminKey)
 	if err != nil {
@@ -541,7 +551,8 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 	if _, err = factory("system:kube-proxy", nil, runtime.ClientKubeProxyCert, runtime.ClientKubeProxyKey); err != nil {
 		return err
 	}
-	if _, err = factory("system:k3s-controller", nil, runtime.ClientK3sControllerCert, runtime.ClientK3sControllerKey); err != nil {
+	// This user (system:k3s-controller by default) must be bound to a role in rolebindings.yaml or the downstream equivalent
+	if _, err = factory("system:"+version.Program+"-controller", nil, runtime.ClientK3sControllerCert, runtime.ClientK3sControllerKey); err != nil {
 		return err
 	}
 
@@ -563,8 +574,8 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 }
 
 func createServerSigningCertKey(config *config.Control, runtime *config.ControlRuntime) (bool, error) {
-	TokenCA := path.Join(config.DataDir, "tls", "token-ca.crt")
-	TokenCAKey := path.Join(config.DataDir, "tls", "token-ca.key")
+	TokenCA := filepath.Join(config.DataDir, "tls", "token-ca.crt")
+	TokenCAKey := filepath.Join(config.DataDir, "tls", "token-ca.key")
 
 	if exists(TokenCA, TokenCAKey) && !exists(runtime.ServerCA) && !exists(runtime.ServerCAKey) {
 		logrus.Infof("Upgrading token-ca files to server-ca")
@@ -576,7 +587,18 @@ func createServerSigningCertKey(config *config.Control, runtime *config.ControlR
 		}
 		return true, nil
 	}
-	return createSigningCertKey("k3s-server", runtime.ServerCA, runtime.ServerCAKey)
+	return createSigningCertKey(version.Program+"-server", runtime.ServerCA, runtime.ServerCAKey)
+}
+
+func addSANs(altNames *certutil.AltNames, sans []string) {
+	for _, san := range sans {
+		ip := net.ParseIP(san)
+		if ip == nil {
+			altNames.DNSNames = append(altNames.DNSNames, san)
+		} else {
+			altNames.IPs = append(altNames.IPs, ip)
+		}
+	}
 }
 
 func genServerCerts(config *config.Control, runtime *config.ControlRuntime) error {
@@ -590,11 +612,15 @@ func genServerCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		return err
 	}
 
+	altNames := &certutil.AltNames{
+		DNSNames: []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes", "localhost"},
+		IPs:      []net.IP{apiServerServiceIP},
+	}
+
+	addSANs(altNames, config.SANs)
+
 	if _, err := createClientCertKey(regen, "kube-apiserver", nil,
-		&certutil.AltNames{
-			DNSNames: []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes", "localhost"},
-			IPs:      []net.IP{apiServerServiceIP, localhostIP},
-		}, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		altNames, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		runtime.ServerCA, runtime.ServerCAKey,
 		runtime.ServingKubeAPICert, runtime.ServingKubeAPIKey); err != nil {
 		return err
@@ -607,8 +633,48 @@ func genServerCerts(config *config.Control, runtime *config.ControlRuntime) erro
 	return nil
 }
 
+func genETCDCerts(config *config.Control, runtime *config.ControlRuntime) error {
+	regen, err := createSigningCertKey("etcd-server", runtime.ETCDServerCA, runtime.ETCDServerCAKey)
+	if err != nil {
+		return err
+	}
+
+	altNames := &certutil.AltNames{
+		DNSNames: []string{"localhost"},
+	}
+	addSANs(altNames, config.SANs)
+
+	if _, err := createClientCertKey(regen, "etcd-server", nil,
+		altNames, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		runtime.ETCDServerCA, runtime.ETCDServerCAKey,
+		runtime.ServerETCDCert, runtime.ServerETCDKey); err != nil {
+		return err
+	}
+
+	if _, err := createClientCertKey(regen, "etcd-client", nil,
+		nil, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		runtime.ETCDServerCA, runtime.ETCDServerCAKey,
+		runtime.ClientETCDCert, runtime.ClientETCDKey); err != nil {
+		return err
+	}
+
+	regen, err = createSigningCertKey("etcd-peer", runtime.ETCDPeerCA, runtime.ETCDPeerCAKey)
+	if err != nil {
+		return err
+	}
+
+	if _, err := createClientCertKey(regen, "etcd-peer", nil,
+		altNames, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		runtime.ETCDPeerCA, runtime.ETCDPeerCAKey,
+		runtime.PeerServerClientETCDCert, runtime.PeerServerClientETCDKey); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func genRequestHeaderCerts(config *config.Control, runtime *config.ControlRuntime) error {
-	regen, err := createSigningCertKey("k3s-request-header", runtime.RequestHeaderCA, runtime.RequestHeaderCAKey)
+	regen, err := createSigningCertKey(version.Program+"-request-header", runtime.RequestHeaderCA, runtime.RequestHeaderCAKey)
 	if err != nil {
 		return err
 	}
@@ -635,6 +701,10 @@ func createClientCertKey(regen bool, commonName string, organization []string, a
 	// check for certificate expiration
 	if !regen {
 		regen = expired(certFile, pool)
+	}
+
+	if !regen {
+		regen = sansChanged(certFile, altNames)
 	}
 
 	if !regen {
@@ -777,6 +847,43 @@ func setupStorageBackend(argsMap map[string]string, cfg *config.Control) {
 	}
 }
 
+func sansChanged(certFile string, sans *certutil.AltNames) bool {
+	if sans == nil {
+		return false
+	}
+
+	certBytes, err := ioutil.ReadFile(certFile)
+	if err != nil {
+		return false
+	}
+
+	certificates, err := certutil.ParseCertsPEM(certBytes)
+	if err != nil {
+		return false
+	}
+
+	if len(certificates) == 0 {
+		return false
+	}
+
+	if !sets.NewString(certificates[0].DNSNames...).HasAll(sans.DNSNames...) {
+		return true
+	}
+
+	ips := sets.NewString()
+	for _, ip := range certificates[0].IPAddresses {
+		ips.Insert(ip.String())
+	}
+
+	for _, ip := range sans.IPs {
+		if !ips.Has(ip.String()) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func expired(certFile string, pool *x509.CertPool) bool {
 	certBytes, err := ioutil.ReadFile(certFile)
 	if err != nil {
@@ -795,7 +902,7 @@ func expired(certFile string, pool *x509.CertPool) bool {
 	if err != nil {
 		return true
 	}
-	return certutil.IsCertExpired(certificates[0])
+	return certutil.IsCertExpired(certificates[0], config.CertificateRenewDays)
 }
 
 func cloudControllerManager(ctx context.Context, cfg *config.Control, runtime *config.ControlRuntime) {
@@ -805,9 +912,10 @@ func cloudControllerManager(ctx context.Context, cfg *config.Control, runtime *c
 		"cluster-cidr":                 cfg.ClusterIPRange.String(),
 		"bind-address":                 localhostIP.String(),
 		"secure-port":                  "0",
-		"cloud-provider":               "k3s",
+		"cloud-provider":               version.Program,
 		"allow-untagged-cloud":         "true",
 		"node-status-update-frequency": "1m",
+		"profiling":                    "false",
 	}
 	if cfg.NoLeaderElect {
 		argsMap["leader-elect"] = "false"
@@ -851,7 +959,7 @@ func checkForCloudControllerPrivileges(runtime *config.ControlRuntime) error {
 	return nil
 }
 
-func waitForAPIServer(ctx context.Context, runtime *config.ControlRuntime) error {
+func waitForAPIServerInBackground(ctx context.Context, runtime *config.ControlRuntime) error {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", runtime.KubeConfigAdmin)
 	if err != nil {
 		return err
@@ -862,12 +970,40 @@ func waitForAPIServer(ctx context.Context, runtime *config.ControlRuntime) error
 		return err
 	}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-promise(func() error { return app2.WaitForAPIServer(k8sClient, 5*time.Minute) }):
-		return err
-	}
+	done := make(chan struct{})
+	runtime.APIServerReady = done
+
+	go func() {
+		defer close(done)
+
+	etcdLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-runtime.ETCDReady:
+				break etcdLoop
+			case <-time.After(30 * time.Second):
+				logrus.Infof("Waiting for etcd server to become available")
+			}
+		}
+
+		logrus.Infof("Waiting for API server to become available")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-promise(func() error { return app2.WaitForAPIServer(k8sClient, 30*time.Second) }):
+				if err != nil {
+					logrus.Infof("Waiting for API server to become available")
+					continue
+				}
+				return
+			}
+		}
+	}()
+
+	return nil
 }
 
 func promise(f func() error) <-chan error {

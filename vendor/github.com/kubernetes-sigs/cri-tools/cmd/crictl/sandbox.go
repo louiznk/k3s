@@ -25,10 +25,12 @@ import (
 	"time"
 
 	"github.com/docker/go-units"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/net/context"
 
+	errorUtils "k8s.io/apimachinery/pkg/util/errors"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
@@ -40,14 +42,15 @@ func (a sandboxByCreated) Less(i, j int) bool {
 	return a[i].CreatedAt > a[j].CreatedAt
 }
 
-var runPodCommand = cli.Command{
+var runPodCommand = &cli.Command{
 	Name:      "runp",
 	Usage:     "Run a new pod",
 	ArgsUsage: "pod-config.[json|yaml]",
 	Flags: []cli.Flag{
-		cli.StringFlag{
-			Name:  "runtime, r",
-			Usage: "Runtime handler to use. Available options are defined by the container runtime.",
+		&cli.StringFlag{
+			Name:    "runtime",
+			Aliases: []string{"r"},
+			Usage:   "Runtime handler to use. Available options are defined by the container runtime.",
 		},
 	},
 
@@ -65,20 +68,20 @@ var runPodCommand = cli.Command{
 
 		podSandboxConfig, err := loadPodSandboxConfig(sandboxSpec)
 		if err != nil {
-			return fmt.Errorf("load podSandboxConfig failed: %v", err)
+			return errors.Wrap(err, "load podSandboxConfig")
 		}
 
 		// Test RuntimeServiceClient.RunPodSandbox
 		podID, err := RunPodSandbox(runtimeClient, podSandboxConfig, context.String("runtime"))
 		if err != nil {
-			return fmt.Errorf("run pod sandbox failed: %v", err)
+			return errors.Wrap(err, "run pod sandbox")
 		}
 		fmt.Println(podID)
 		return nil
 	},
 }
 
-var stopPodCommand = cli.Command{
+var stopPodCommand = &cli.Command{
 	Name:      "stopp",
 	Usage:     "Stop one or more running pods",
 	ArgsUsage: "POD-ID [POD-ID...]",
@@ -95,27 +98,28 @@ var stopPodCommand = cli.Command{
 			id := context.Args().Get(i)
 			err := StopPodSandbox(runtimeClient, id)
 			if err != nil {
-				return fmt.Errorf("stopping the pod sandbox %q failed: %v", id, err)
+				return errors.Wrapf(err, "stopping the pod sandbox %q", id)
 			}
 		}
 		return nil
 	},
 }
 
-var removePodCommand = cli.Command{
+var removePodCommand = &cli.Command{
 	Name:                   "rmp",
 	Usage:                  "Remove one or more pods",
 	ArgsUsage:              "POD-ID [POD-ID...]",
-	SkipArgReorder:         true,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "force, f",
-			Usage: "Force removal of the pod sandbox, disregarding if running",
+		&cli.BoolFlag{
+			Name:    "force",
+			Aliases: []string{"f"},
+			Usage:   "Force removal of the pod sandbox, disregarding if running",
 		},
-		cli.BoolFlag{
-			Name:  "all, a",
-			Usage: "Remove all pods",
+		&cli.BoolFlag{
+			Name:    "all",
+			Aliases: []string{"a"},
+			Usage:   "Remove all pods",
 		},
 	},
 	Action: func(ctx *cli.Context) error {
@@ -125,7 +129,7 @@ var removePodCommand = cli.Command{
 		}
 		defer closeConnection(ctx, runtimeConn)
 
-		ids := ctx.Args()
+		ids := ctx.Args().Slice()
 		if ctx.Bool("all") {
 			r, err := runtimeClient.ListPodSandbox(context.Background(),
 				&pb.ListPodSandboxRequest{})
@@ -138,62 +142,61 @@ var removePodCommand = cli.Command{
 			}
 		}
 
-		if len(ids) == 0 {
+		lenIDs := len(ids)
+		if lenIDs == 0 {
 			return cli.ShowSubcommandHelp(ctx)
 		}
 
-		errored := false
+		funcs := []func() error{}
 		for _, id := range ids {
-			resp, err := runtimeClient.PodSandboxStatus(context.Background(),
-				&pb.PodSandboxStatusRequest{PodSandboxId: id})
-			if err != nil {
-				logrus.Error(err)
-				errored = true
-				continue
-			}
-			if resp.Status.State == pb.PodSandboxState_SANDBOX_READY {
-				if ctx.Bool("force") {
-					if err := StopPodSandbox(runtimeClient, id); err != nil {
-						logrus.Errorf("stopping the pod sandbox %q failed: %v", id, err)
-						errored = true
-						continue
-					}
-				} else {
-					logrus.Errorf("pod sandbox %q is running, please stop it first", id)
-					errored = true
-					continue
+			funcs = append(funcs, func() error {
+				resp, err := runtimeClient.PodSandboxStatus(context.Background(),
+					&pb.PodSandboxStatusRequest{PodSandboxId: id})
+				if err != nil {
+					return errors.Wrapf(err, "getting sandbox status of pod %q", id)
 				}
-			}
+				if resp.Status.State == pb.PodSandboxState_SANDBOX_READY {
+					if ctx.Bool("force") {
+						if err := StopPodSandbox(runtimeClient, id); err != nil {
+							return errors.Wrapf(err, "stopping the pod sandbox %q failed", id)
+						}
+					} else {
+						return errors.Errorf("pod sandbox %q is running, please stop it first", id)
+					}
+				}
 
-			err = RemovePodSandbox(runtimeClient, id)
-			if err != nil {
-				logrus.Errorf("removing the pod sandbox %q failed: %v", id, err)
-				errored = true
-				continue
-			}
+				err = RemovePodSandbox(runtimeClient, id)
+				if err != nil {
+					return errors.Wrapf(err, "removing the pod sandbox %q", id)
+				}
+
+				return nil
+			})
 		}
 
-		if errored {
-			return fmt.Errorf("unable to remove sandbox(es)")
-		}
-		return nil
+		return errorUtils.AggregateGoroutines(funcs...)
 	},
 }
 
-var podStatusCommand = cli.Command{
+var podStatusCommand = &cli.Command{
 	Name:                   "inspectp",
 	Usage:                  "Display the status of one or more pods",
 	ArgsUsage:              "POD-ID [POD-ID...]",
-	SkipArgReorder:         true,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
-		cli.StringFlag{
-			Name:  "output, o",
-			Usage: "Output format, One of: json|yaml|table",
+		&cli.StringFlag{
+			Name:    "output",
+			Aliases: []string{"o"},
+			Usage:   "Output format, One of: json|yaml|go-template|table",
 		},
-		cli.BoolFlag{
-			Name:  "quiet, q",
-			Usage: "Do not show verbose information",
+		&cli.BoolFlag{
+			Name:    "quiet",
+			Aliases: []string{"q"},
+			Usage:   "Do not show verbose information",
+		},
+		&cli.StringFlag{
+			Name:  "template",
+			Usage: "The template string is only used when output is go-template; The Template format is golang template",
 		},
 	},
 	Action: func(context *cli.Context) error {
@@ -208,66 +211,72 @@ var podStatusCommand = cli.Command{
 		for i := 0; i < context.NArg(); i++ {
 			id := context.Args().Get(i)
 
-			err := PodSandboxStatus(runtimeClient, id, context.String("output"), context.Bool("quiet"))
+			err := PodSandboxStatus(runtimeClient, id, context.String("output"), context.Bool("quiet"), context.String("template"))
 			if err != nil {
-				return fmt.Errorf("getting the pod sandbox status for %q failed: %v", id, err)
+				return errors.Wrapf(err, "getting the pod sandbox status for %q", id)
 			}
 		}
 		return nil
 	},
 }
 
-var listPodCommand = cli.Command{
+var listPodCommand = &cli.Command{
 	Name:                   "pods",
 	Usage:                  "List pods",
-	SkipArgReorder:         true,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "id",
 			Value: "",
 			Usage: "filter by pod id",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "name",
 			Value: "",
 			Usage: "filter by pod name regular expression pattern",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "namespace",
 			Value: "",
 			Usage: "filter by pod namespace regular expression pattern",
 		},
-		cli.StringFlag{
-			Name:  "state, s",
-			Value: "",
-			Usage: "filter by pod state",
+		&cli.StringFlag{
+			Name:    "state",
+			Aliases: []string{"s"},
+			Value:   "",
+			Usage:   "filter by pod state",
 		},
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:  "label",
 			Usage: "filter by key=value label",
 		},
-		cli.BoolFlag{
-			Name:  "verbose, v",
-			Usage: "show verbose info for pods",
+		&cli.BoolFlag{
+			Name:    "verbose",
+			Aliases: []string{"v"},
+			Usage:   "show verbose info for pods",
 		},
-		cli.BoolFlag{
-			Name:  "quiet, q",
-			Usage: "list only pod IDs",
+		&cli.BoolFlag{
+			Name:    "quiet",
+			Aliases: []string{"q"},
+			Usage:   "list only pod IDs",
 		},
-		cli.StringFlag{
-			Name:  "output, o",
-			Usage: "Output format, One of: json|yaml|table",
+		&cli.StringFlag{
+			Name:    "output",
+			Aliases: []string{"o"},
+			Usage:   "Output format, One of: json|yaml|table",
+			Value:   "table",
 		},
-		cli.BoolFlag{
-			Name:  "latest, l",
-			Usage: "Show the most recently created pod",
+		&cli.BoolFlag{
+			Name:    "latest",
+			Aliases: []string{"l"},
+			Usage:   "Show the most recently created pod",
 		},
-		cli.IntFlag{
-			Name:  "last, n",
-			Usage: "Show last n recently created pods. Set 0 for unlimited",
+		&cli.IntFlag{
+			Name:    "last",
+			Aliases: []string{"n"},
+			Usage:   "Show last n recently created pods. Set 0 for unlimited",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "no-trunc",
 			Usage: "Show output without truncating the ID",
 		},
@@ -297,7 +306,7 @@ var listPodCommand = cli.Command{
 			return err
 		}
 		if err = ListPodSandboxes(runtimeClient, opts); err != nil {
-			return fmt.Errorf("listing pod sandboxes failed: %v", err)
+			return errors.Wrap(err, "listing pod sandboxes")
 		}
 		return nil
 	},
@@ -372,7 +381,7 @@ func marshalPodSandboxStatus(ps *pb.PodSandboxStatus) (string, error) {
 
 // PodSandboxStatus sends a PodSandboxStatusRequest to the server, and parses
 // the returned PodSandboxStatusResponse.
-func PodSandboxStatus(client pb.RuntimeServiceClient, ID, output string, quiet bool) error {
+func PodSandboxStatus(client pb.RuntimeServiceClient, ID, output string, quiet bool, tmplStr string) error {
 	verbose := !(quiet)
 	if output == "" { // default to json output
 		output = "json"
@@ -397,8 +406,8 @@ func PodSandboxStatus(client pb.RuntimeServiceClient, ID, output string, quiet b
 		return err
 	}
 	switch output {
-	case "json", "yaml":
-		return outputStatusInfo(status, r.Info, output)
+	case "json", "yaml", "go-template":
+		return outputStatusInfo(status, r.Info, output, tmplStr)
 	case "table": // table output is after this switch block
 	default:
 		return fmt.Errorf("output option cannot be %s", output)
@@ -487,7 +496,7 @@ func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
 		return outputProtobufObjAsJSON(r)
 	case "yaml":
 		return outputProtobufObjAsYAML(r)
-	case "table", "":
+	case "table":
 	// continue; output will be generated after the switch block ends.
 	default:
 		return fmt.Errorf("unsupported output format %q", opts.output)
@@ -495,7 +504,15 @@ func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
 
 	display := newTableDisplay(20, 1, 3, ' ', 0)
 	if !opts.verbose && !opts.quiet {
-		display.AddRow([]string{columnPodID, columnCreated, columnState, columnName, columnNamespace, columnAttempt})
+		display.AddRow([]string{
+			columnPodID,
+			columnCreated,
+			columnState,
+			columnName,
+			columnNamespace,
+			columnAttempt,
+			columnPodRuntime,
+		})
 	}
 	for _, pod := range r.Items {
 		if opts.quiet {
@@ -509,8 +526,15 @@ func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
 			if !opts.noTrunc {
 				id = getTruncatedID(id, "")
 			}
-			display.AddRow([]string{id, ctm, convertPodState(pod.State), pod.Metadata.Name,
-				pod.Metadata.Namespace, fmt.Sprintf("%d", pod.Metadata.Attempt)})
+			display.AddRow([]string{
+				id,
+				ctm,
+				convertPodState(pod.State),
+				pod.Metadata.Name,
+				pod.Metadata.Namespace,
+				fmt.Sprintf("%d", pod.Metadata.Attempt),
+				getSandboxesRuntimeHandler(pod),
+			})
 			continue
 		}
 
@@ -544,6 +568,10 @@ func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
 				fmt.Printf("\t%s -> %s\n", k, pod.Annotations[k])
 			}
 		}
+		fmt.Printf("%s: %s\n",
+			strings.Title(strings.ToLower(columnPodRuntime)),
+			getSandboxesRuntimeHandler(pod))
+
 		fmt.Println()
 	}
 
@@ -561,6 +589,13 @@ func convertPodState(state pb.PodSandboxState) string {
 		log.Fatalf("Unknown pod state %q", state)
 		return ""
 	}
+}
+
+func getSandboxesRuntimeHandler(sandbox *pb.PodSandbox) string {
+	if sandbox.RuntimeHandler == "" {
+		return "(default)"
+	}
+	return sandbox.RuntimeHandler
 }
 
 func getSandboxesList(sandboxesList []*pb.PodSandbox, opts listOptions) []*pb.PodSandbox {

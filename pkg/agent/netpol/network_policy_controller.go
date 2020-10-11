@@ -6,6 +6,7 @@
 package netpol
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base32"
 	"errors"
@@ -1692,7 +1693,11 @@ func NewNetworkPolicyController(
 	npc.syncPeriod = ipTablesSyncPeriod
 
 	npc.v1NetworkPolicy = true
-	v, _ := clientset.Discovery().ServerVersion()
+	v, err := clientset.Discovery().ServerVersion()
+	if err != nil {
+		return nil, err
+	}
+
 	valid := regexp.MustCompile("[0-9]")
 	v.Minor = strings.Join(valid.FindAllString(v.Minor, -1), "")
 	minorVer, _ := strconv.Atoi(v.Minor)
@@ -1700,7 +1705,7 @@ func NewNetworkPolicyController(
 		npc.v1NetworkPolicy = false
 	}
 
-	node, err := clientset.CoreV1().Nodes().Get(hostnameOverride, metav1.GetOptions{})
+	node, err := clientset.CoreV1().Nodes().Get(context.TODO(), hostnameOverride, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}

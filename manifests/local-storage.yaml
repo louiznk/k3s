@@ -59,7 +59,7 @@ spec:
             effect: "NoSchedule"
       containers:
       - name: local-path-provisioner
-        image: rancher/local-path-provisioner:v0.0.11
+        image: rancher/local-path-provisioner:v0.0.14
         imagePullPolicy: IfNotPresent
         command:
         - local-path-provisioner
@@ -74,6 +74,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: HELPER_IMAGE
+          value: rancher/library-busybox:1.31.1
       volumes:
         - name: config-volume
           configMap:

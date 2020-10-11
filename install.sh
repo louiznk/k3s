@@ -8,7 +8,7 @@ set -e
 #
 # Example:
 #   Installing a server without traefik:
-#     curl ... | INSTALL_K3S_EXEC="--no-deploy=traefik" sh -
+#     curl ... | INSTALL_K3S_EXEC="--disable=traefik" sh -
 #   Installing an agent to point at a server:
 #     curl ... | K3S_TOKEN=xxx K3S_URL=https://server-url:6443 sh -
 #
@@ -33,8 +33,8 @@ set -e
 #     If set to true will not start k3s service.
 #
 #   - INSTALL_K3S_VERSION
-#     Version of k3s to download from github. Will attempt to download the
-#     latest version if not specified.
+#     Version of k3s to download from github. Will attempt to download from the
+#     stable channel if not specified.
 #
 #   - INSTALL_K3S_COMMIT
 #     Commit of k3s to download from temporary cloud storage.
@@ -59,11 +59,11 @@ set -e
 #     of EXEC and script args ($@).
 #
 #     The following commands result in the same behavior:
-#       curl ... | INSTALL_K3S_EXEC="--no-deploy=traefik" sh -s -
-#       curl ... | INSTALL_K3S_EXEC="server --no-deploy=traefik" sh -s -
-#       curl ... | INSTALL_K3S_EXEC="server" sh -s - --no-deploy=traefik
-#       curl ... | sh -s - server --no-deploy=traefik
-#       curl ... | sh -s - --no-deploy=traefik
+#       curl ... | INSTALL_K3S_EXEC="--disable=traefik" sh -s -
+#       curl ... | INSTALL_K3S_EXEC="server --disable=traefik" sh -s -
+#       curl ... | INSTALL_K3S_EXEC="server" sh -s - --disable=traefik
+#       curl ... | sh -s - server --disable=traefik
+#       curl ... | sh -s - --disable=traefik
 #
 #   - INSTALL_K3S_NAME
 #     Name of systemd service to create, will default from the k3s exec command
@@ -72,6 +72,17 @@ set -e
 #   - INSTALL_K3S_TYPE
 #     Type of systemd service to create, will default from the k3s exec command
 #     if not specified.
+#
+#   - INSTALL_K3S_SELINUX_WARN
+#     If set to true will continue if k3s-selinux policy is not found.
+#
+#   - INSTALL_K3S_CHANNEL_URL
+#     Channel URL for fetching k3s download URL.
+#     Defaults to 'https://update.k3s.io/v1-release/channels'.
+#
+#   - INSTALL_K3S_CHANNEL
+#     Channel to use for fetching k3s download URL.
+#     Defaults to 'stable'.
 
 GITHUB_URL=https://github.com/rancher/k3s/releases
 STORAGE_URL=https://storage.googleapis.com/k3s-ci-builds
@@ -81,6 +92,10 @@ DOWNLOADER=
 info()
 {
     echo '[INFO] ' "$@"
+}
+warn()
+{
+    echo '[WARN] ' "$@" >&2
 }
 fatal()
 {
@@ -126,6 +141,19 @@ escape_dq() {
     printf '%s' "$@" | sed -e 's/"/\\"/g'
 }
 
+# --- ensures $K3S_URL is empty or begins with https://, exiting fatally otherwise ---
+verify_k3s_url() {
+    case "${K3S_URL}" in
+        "")
+            ;;
+        https://*)
+            ;;
+        *)
+            fatal "Only https:// URLs are supported for K3S_URL (have ${K3S_URL})"
+            ;;
+    esac
+}
+
 # --- define needed environment variables ---
 setup_env() {
     # --- use command args if passed or create default ---
@@ -135,8 +163,8 @@ setup_env() {
             if [ -z "${K3S_URL}" ]; then
                 CMD_K3S=server
             else
-                if [ -z "${K3S_TOKEN}" ] && [ -z "${K3S_CLUSTER_SECRET}" ]; then
-                    fatal "Defaulted k3s exec command to 'agent' because K3S_URL is defined, but K3S_TOKEN or K3S_CLUSTER_SECRET is not defined."
+                if [ -z "${K3S_TOKEN}" ] && [ -z "${K3S_TOKEN_FILE}" ] && [ -z "${K3S_CLUSTER_SECRET}" ]; then
+                    fatal "Defaulted k3s exec command to 'agent' because K3S_URL is defined, but K3S_TOKEN, K3S_TOKEN_FILE or K3S_CLUSTER_SECRET is not defined."
                 fi
                 CMD_K3S=agent
             fi
@@ -147,6 +175,9 @@ setup_env() {
             shift
         ;;
     esac
+
+    verify_k3s_url
+
     CMD_K3S_EXEC="${CMD_K3S}$(quote_indent "$@")"
 
     # --- use systemd name if defined or create default ---
@@ -222,6 +253,10 @@ setup_env() {
     if [ "${INSTALL_K3S_BIN_DIR_READ_ONLY}" = true ]; then
         INSTALL_K3S_SKIP_DOWNLOAD=true
     fi
+
+    # --- setup channel values
+    INSTALL_K3S_CHANNEL_URL=${INSTALL_K3S_CHANNEL_URL:-'https://update.k3s.io/v1-release/channels'}
+    INSTALL_K3S_CHANNEL=${INSTALL_K3S_CHANNEL:-'stable'}
 }
 
 # --- check if skip download environment variable set ---
@@ -294,20 +329,21 @@ setup_tmp() {
     trap cleanup INT EXIT
 }
 
-# --- use desired k3s version if defined or find latest ---
+# --- use desired k3s version if defined or find version from channel ---
 get_release_version() {
     if [ -n "${INSTALL_K3S_COMMIT}" ]; then
         VERSION_K3S="commit ${INSTALL_K3S_COMMIT}"
     elif [ -n "${INSTALL_K3S_VERSION}" ]; then
         VERSION_K3S=${INSTALL_K3S_VERSION}
     else
-        info "Finding latest release"
+        info "Finding release for channel ${INSTALL_K3S_CHANNEL}"
+        version_url="${INSTALL_K3S_CHANNEL_URL}/${INSTALL_K3S_CHANNEL}"
         case $DOWNLOADER in
             curl)
-                VERSION_K3S=$(curl -w '%{url_effective}' -I -L -s -S ${GITHUB_URL}/latest -o /dev/null | sed -e 's|.*/||')
+                VERSION_K3S=$(curl -w '%{url_effective}' -L -s -S ${version_url} -o /dev/null | sed -e 's|.*/||')
                 ;;
             wget)
-                VERSION_K3S=$(wget -SqO /dev/null ${GITHUB_URL}/latest 2>&1 | grep -i Location | sed -e 's|.*/||')
+                VERSION_K3S=$(wget -SqO /dev/null ${version_url} 2>&1 | grep -i Location | sed -e 's|.*/||')
                 ;;
             *)
                 fatal "Incorrect downloader executable '$DOWNLOADER'"
@@ -389,10 +425,26 @@ setup_binary() {
     info "Installing k3s to ${BIN_DIR}/k3s"
     $SUDO chown root:root ${TMP_BIN}
     $SUDO mv -f ${TMP_BIN} ${BIN_DIR}/k3s
+}
 
-    if ! $SUDO chcon -u system_u -r object_r -t container_runtime_exec_t ${BIN_DIR}/k3s 2>/dev/null 2>&1; then
-        if $SUDO grep SELINUX=enforcing /etc/selinux/config >/dev/null 2>&1; then
-            fatal "Failed to apply container_runtime_exec_t to ${BIN_DIR}/k3s, please install k3s-selinux RPM"
+# --- setup selinux policy ---
+setup_selinux() {
+    policy_hint="please install:
+    yum install -y container-selinux selinux-policy-base
+    yum install -y https://rpm.rancher.io/k3s-selinux-0.1.1-rc1.el7.noarch.rpm
+"
+    policy_error=fatal
+    if [ "$INSTALL_K3S_SELINUX_WARN" = true ]; then
+        policy_error=warn
+    fi
+
+    if ! $SUDO chcon -u system_u -r object_r -t container_runtime_exec_t ${BIN_DIR}/k3s >/dev/null 2>&1; then
+        if $SUDO grep '^\s*SELINUX=enforcing' /etc/selinux/config >/dev/null 2>&1; then
+            $policy_error "Failed to apply container_runtime_exec_t to ${BIN_DIR}/k3s, ${policy_hint}"
+        fi
+    else
+        if [ ! -f /usr/share/selinux/packages/k3s.pp ]; then
+            $policy_error "Failed to find the k3s-selinux policy, ${policy_hint}"
         fi
     fi
 }
@@ -494,18 +546,7 @@ getshims() {
 killtree $({ set +x; } 2>/dev/null; getshims; set -x)
 
 do_unmount() {
-    { set +x; } 2>/dev/null
-    MOUNTS=
-    while read ignore mount ignore; do
-        MOUNTS="$mount\n$MOUNTS"
-    done </proc/self/mounts
-    MOUNTS=$(printf $MOUNTS | grep "^$1" | sort -r)
-    if [ -n "${MOUNTS}" ]; then
-        set -x
-        umount ${MOUNTS}
-    else
-        set -x
-    fi
+    awk -v path="$1" '$2 ~ ("^" path) { print $2 }' /proc/self/mounts | sort -r | xargs -r -t -n 1 umount
 }
 
 do_unmount '/run/k3s'
@@ -567,6 +608,8 @@ for cmd in kubectl crictl ctr; do
 done
 
 rm -rf /etc/rancher/k3s
+rm -rf /run/k3s
+rm -rf /run/flannel
 rm -rf /var/lib/rancher/k3s
 rm -rf /var/lib/kubelet
 rm -f ${BIN_DIR}/k3s
@@ -600,7 +643,9 @@ create_systemd_service_file() {
 [Unit]
 Description=Lightweight Kubernetes
 Documentation=https://k3s.io
+After=network-online.target
 Wants=network-online.target
+After=network-online.target
 
 [Install]
 WantedBy=multi-user.target
@@ -610,7 +655,9 @@ Type=${SYSTEMD_TYPE}
 EnvironmentFile=${FILE_K3S_ENV}
 KillMode=process
 Delegate=yes
-LimitNOFILE=infinity
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
 TasksMax=infinity
@@ -653,6 +700,7 @@ error_log=${LOG_FILE}
 
 pidfile="/var/run/${SYSTEM_NAME}.pid"
 respawn_delay=5
+respawn_max=0
 
 set -o allexport
 if [ -f /etc/environment ]; then source /etc/environment; fi
@@ -733,6 +781,7 @@ eval set -- $(escape "${INSTALL_K3S_EXEC}") $(quote "$@")
     verify_system
     setup_env "$@"
     download_and_verify
+    setup_selinux
     create_symlinks
     create_killall
     create_uninstall

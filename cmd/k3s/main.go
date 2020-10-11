@@ -12,7 +12,10 @@ import (
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	"github.com/rancher/k3s/pkg/data"
 	"github.com/rancher/k3s/pkg/datadir"
+	"github.com/rancher/k3s/pkg/dataverify"
+	"github.com/rancher/k3s/pkg/flock"
 	"github.com/rancher/k3s/pkg/untar"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -24,8 +27,8 @@ func main() {
 
 	app := cmds.NewApp()
 	app.Commands = []cli.Command{
-		cmds.NewServerCommand(wrap("k3s-server", os.Args)),
-		cmds.NewAgentCommand(wrap("k3s-agent", os.Args)),
+		cmds.NewServerCommand(wrap(version.Program+"-server", os.Args)),
+		cmds.NewAgentCommand(wrap(version.Program+"-agent", os.Args)),
 		cmds.NewKubectlCommand(externalCLIAction("kubectl")),
 		cmds.NewCRICTL(externalCLIAction("crictl")),
 		cmds.NewCtrCommand(externalCLIAction("ctr")),
@@ -39,6 +42,9 @@ func main() {
 }
 
 func runCLIs() bool {
+	if os.Getenv("CRI_CONFIG_FILE") == "" {
+		os.Setenv("CRI_CONFIG_FILE", datadir.DefaultDataDir+"/agent/etc/crictl.yaml")
+	}
 	for _, cmd := range []string{"kubectl", "ctr", "crictl"} {
 		if filepath.Base(os.Args[0]) == cmd {
 			if err := externalCLI(cmd, "", os.Args[1:]); err != nil {
@@ -84,11 +90,12 @@ func stageAndRun(dataDir string, cmd string, args []string) error {
 	if err != nil {
 		return errors.Wrap(err, "extracting data")
 	}
+	logrus.Debugf("Asset dir %s", dir)
 
 	if err := os.Setenv("PATH", filepath.Join(dir, "bin")+":"+os.Getenv("PATH")+":"+filepath.Join(dir, "bin/aux")); err != nil {
 		return err
 	}
-	if err := os.Setenv("K3S_DATA_DIR", dir); err != nil {
+	if err := os.Setenv(version.ProgramUpper+"_DATA_DIR", dir); err != nil {
 		return err
 	}
 
@@ -98,6 +105,7 @@ func stageAndRun(dataDir string, cmd string, args []string) error {
 	}
 
 	logrus.Debugf("Running %s %v", cmd, args)
+
 	return syscall.Exec(cmd, args, os.Environ())
 }
 
@@ -111,13 +119,27 @@ func extract(dataDir string) (string, error) {
 	// first look for global asset folder so we don't create a HOME version if not needed
 	_, dir := getAssetAndDir(datadir.DefaultDataDir)
 	if _, err := os.Stat(dir); err == nil {
-		logrus.Debugf("Asset dir %s", dir)
 		return dir, nil
 	}
 
 	asset, dir := getAssetAndDir(dataDir)
+	// check if target directory already exists
 	if _, err := os.Stat(dir); err == nil {
-		logrus.Debugf("Asset dir %s", dir)
+		return dir, nil
+	}
+
+	// acquire a data directory lock
+	os.MkdirAll(filepath.Join(dataDir, "data"), 0755)
+	lockFile := filepath.Join(dataDir, "data", ".lock")
+	logrus.Infof("Acquiring lock file %s", lockFile)
+	lock, err := flock.Acquire(lockFile)
+	if err != nil {
+		return "", err
+	}
+	defer flock.Release(lock)
+
+	// check again if target directory exists
+	if _, err := os.Stat(dir); err == nil {
 		return dir, nil
 	}
 
@@ -131,12 +153,24 @@ func extract(dataDir string) (string, error) {
 
 	tempDest := dir + "-tmp"
 	defer os.RemoveAll(tempDest)
-
 	os.RemoveAll(tempDest)
 
 	if err := untar.Untar(buf, tempDest); err != nil {
 		return "", err
 	}
+	if err := dataverify.Verify(filepath.Join(tempDest, "bin")); err != nil {
+		return "", err
+	}
 
+	currentSymLink := filepath.Join(dataDir, "data", "current")
+	previousSymLink := filepath.Join(dataDir, "data", "previous")
+	if _, err := os.Lstat(currentSymLink); err == nil {
+		if err := os.Rename(currentSymLink, previousSymLink); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Symlink(dir, currentSymLink); err != nil {
+		return "", err
+	}
 	return dir, os.Rename(tempDest, dir)
 }

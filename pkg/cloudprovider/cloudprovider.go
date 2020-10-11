@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/rancher/wrangler-api/pkg/generated/controllers/core"
 	coreclient "github.com/rancher/wrangler-api/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/pkg/start"
@@ -15,7 +16,7 @@ type k3s struct {
 }
 
 func init() {
-	cloudprovider.RegisterCloudProvider("k3s", func(config io.Reader) (cloudprovider.Interface, error) {
+	cloudprovider.RegisterCloudProvider(version.Program, func(config io.Reader) (cloudprovider.Interface, error) {
 		return &k3s{}, nil
 	})
 }
@@ -30,6 +31,10 @@ func (k *k3s) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, st
 
 func (k *k3s) Instances() (cloudprovider.Instances, bool) {
 	return k, true
+}
+
+func (k *k3s) InstancesV2() (cloudprovider.InstancesV2, bool) {
+	return nil, false
 }
 
 func (k *k3s) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
@@ -49,7 +54,7 @@ func (k *k3s) Routes() (cloudprovider.Routes, bool) {
 }
 
 func (k *k3s) ProviderName() string {
-	return "k3s"
+	return version.Program
 }
 
 func (k *k3s) HasClusterID() bool {

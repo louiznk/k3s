@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/rancher/k3s/pkg/version"
 	appclient "github.com/rancher/wrangler-api/pkg/generated/controllers/apps/v1"
 	coreclient "github.com/rancher/wrangler-api/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/pkg/apply"
@@ -26,12 +27,15 @@ import (
 	coregetter "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
+var (
+	svcNameLabel       = "svccontroller." + version.Program + ".cattle.io/svcname"
+	daemonsetNodeLabel = "svccontroller." + version.Program + ".cattle.io/enablelb"
+	nodeSelectorLabel  = "svccontroller." + version.Program + ".cattle.io/nodeselector"
+)
+
 const (
-	image              = "rancher/klipper-lb:v0.1.2"
-	svcNameLabel       = "svccontroller.k3s.cattle.io/svcname"
-	daemonsetNodeLabel = "svccontroller.k3s.cattle.io/enablelb"
-	nodeSelectorLabel  = "svccontroller.k3s.cattle.io/nodeselector"
-	Ready              = condition.Cond("Ready")
+	image = "rancher/klipper-lb:v0.1.2"
+	Ready = condition.Cond("Ready")
 )
 
 var (
@@ -187,7 +191,7 @@ func (h *handler) updateService(svc *core.Service) (runtime.Object, error) {
 	}
 
 	logrus.Debugf("Setting service loadbalancer %s/%s to IPs %v", svc.Namespace, svc.Name, expectedIPs)
-	return h.services.Services(svc.Namespace).UpdateStatus(svc)
+	return h.services.Services(svc.Namespace).UpdateStatus(context.TODO(), svc, meta.UpdateOptions{})
 }
 
 func serviceIPs(svc *core.Service) []string {
@@ -391,7 +395,7 @@ func (h *handler) newDaemonSet(svc *core.Service) (*apps.DaemonSet, error) {
 }
 
 func (h *handler) updateDaemonSets() error {
-	daemonsets, err := h.daemonsets.DaemonSets("").List(meta.ListOptions{
+	daemonsets, err := h.daemonsets.DaemonSets("").List(context.TODO(), meta.ListOptions{
 		LabelSelector: nodeSelectorLabel + "=false",
 	})
 	if err != nil {
@@ -403,7 +407,7 @@ func (h *handler) updateDaemonSets() error {
 			daemonsetNodeLabel: "true",
 		}
 		ds.Labels[nodeSelectorLabel] = "true"
-		if _, err := h.daemonsets.DaemonSets(ds.Namespace).Update(&ds); err != nil {
+		if _, err := h.daemonsets.DaemonSets(ds.Namespace).Update(context.TODO(), &ds, meta.UpdateOptions{}); err != nil {
 			return err
 		}
 
@@ -420,5 +424,5 @@ func (h *handler) deleteOldDeployments(svc *core.Service) error {
 		}
 		return err
 	}
-	return h.deployments.Deployments(svc.Namespace).Delete(name, &meta.DeleteOptions{})
+	return h.deployments.Deployments(svc.Namespace).Delete(context.TODO(), name, meta.DeleteOptions{})
 }

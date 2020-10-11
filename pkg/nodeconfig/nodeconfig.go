@@ -9,20 +9,24 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/rancher/k3s/pkg/version"
 	corev1 "k8s.io/api/core/v1"
 )
 
+var (
+	NodeArgsAnnotation       = version.Program + ".io/node-args"
+	NodeEnvAnnotation        = version.Program + ".io/node-env"
+	NodeConfigHashAnnotation = version.Program + ".io/node-config-hash"
+)
+
 const (
-	NodeArgsAnnotation       = "k3s.io/node-args"
-	NodeEnvAnnotation        = "k3s.io/node-env"
-	NodeConfigHashAnnotation = "k3s.io/node-config-hash"
-	OmittedValue             = "********"
+	OmittedValue = "********"
 )
 
 func getNodeArgs() (string, error) {
 	nodeArgsList := []string{}
 	for _, arg := range os.Args[1:] {
-		if strings.Contains(arg, "=") {
+		if strings.HasPrefix(arg, "--") && strings.Contains(arg, "=") {
 			parsedArg := strings.SplitN(arg, "=", 2)
 			nodeArgsList = append(nodeArgsList, parsedArg...)
 			continue
@@ -47,7 +51,7 @@ func getNodeEnv() (string, error) {
 	k3sEnv := make(map[string]string)
 	for _, v := range os.Environ() {
 		keyValue := strings.SplitN(v, "=", 2)
-		if strings.HasPrefix(keyValue[0], "K3S_") {
+		if strings.HasPrefix(keyValue[0], version.ProgramUpper+"_") {
 			k3sEnv[keyValue[0]] = keyValue[1]
 		}
 	}
@@ -85,6 +89,7 @@ func SetNodeConfigAnnotations(node *corev1.Node) (bool, error) {
 	if node.Annotations[NodeConfigHashAnnotation] == encoded {
 		return false, nil
 	}
+
 	node.Annotations[NodeEnvAnnotation] = nodeEnv
 	node.Annotations[NodeArgsAnnotation] = nodeArgs
 	node.Annotations[NodeConfigHashAnnotation] = encoded
@@ -93,10 +98,10 @@ func SetNodeConfigAnnotations(node *corev1.Node) (bool, error) {
 
 func isSecret(key string) bool {
 	secretData := []string{
-		"K3S_TOKEN",
-		"K3S_DATASTORE_ENDPOINT",
-		"K3S_AGENT_TOKEN",
-		"K3S_CLUSTER_SECRET",
+		version.ProgramUpper + "_TOKEN",
+		version.ProgramUpper + "_DATASTORE_ENDPOINT",
+		version.ProgramUpper + "_AGENT_TOKEN",
+		version.ProgramUpper + "_CLUSTER_SECRET",
 		"--token",
 		"-t",
 		"--agent-token",

@@ -227,6 +227,10 @@ can be used and modified as necessary as a custom configuration.`
 		}
 		serve(ctx, l, server.ServeGRPC)
 
+		if err := notifyReady(ctx); err != nil {
+			log.G(ctx).WithError(err).Warn("notify ready failed")
+		}
+
 		log.G(ctx).Infof("containerd successfully booted in %fs", time.Since(start).Seconds())
 		<-done
 		return nil
@@ -284,7 +288,7 @@ func setLevel(context *cli.Context, config *srvconfig.Config) error {
 		l = config.Debug.Level
 	}
 	if l != "" {
-		lvl, err := log.ParseLevel(l)
+		lvl, err := logrus.ParseLevel(l)
 		if err != nil {
 			return err
 		}

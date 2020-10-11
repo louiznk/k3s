@@ -19,8 +19,9 @@ package crictl
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
@@ -29,7 +30,7 @@ const (
 	criClientVersion = "v1alpha2"
 )
 
-var runtimeVersionCommand = cli.Command{
+var runtimeVersionCommand = &cli.Command{
 	Name:  "version",
 	Usage: "Display runtime version information",
 	Action: func(context *cli.Context) error {
@@ -40,7 +41,7 @@ var runtimeVersionCommand = cli.Command{
 		defer closeConnection(context, runtimeConn)
 		err = Version(runtimeClient, criClientVersion)
 		if err != nil {
-			return fmt.Errorf("getting the runtime version failed: %v", err)
+			return errors.Wrap(err, "getting the runtime version")
 		}
 		return nil
 	},

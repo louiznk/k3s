@@ -23,8 +23,9 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/net/context"
 	restclient "k8s.io/client-go/rest"
 	portforward "k8s.io/client-go/tools/portforward"
@@ -32,12 +33,12 @@ import (
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
-var runtimePortForwardCommand = cli.Command{
+var runtimePortForwardCommand = &cli.Command{
 	Name:      "port-forward",
 	Usage:     "Forward local port to a pod",
 	ArgsUsage: "POD-ID [LOCAL_PORT:]REMOTE_PORT",
 	Action: func(context *cli.Context) error {
-		args := context.Args()
+		args := context.Args().Slice()
 		if len(args) < 2 {
 			return cli.ShowSubcommandHelp(context)
 		}
@@ -54,7 +55,7 @@ var runtimePortForwardCommand = cli.Command{
 		}
 		err = PortForward(runtimeClient, opts)
 		if err != nil {
-			return fmt.Errorf("port forward failed: %v", err)
+			return errors.Wrap(err, "port forward")
 
 		}
 		return nil

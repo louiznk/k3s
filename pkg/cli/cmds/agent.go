@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/pkg/errors"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/urfave/cli"
 )
 
@@ -19,6 +21,7 @@ type Agent struct {
 	NodeExternalIP           string
 	NodeName                 string
 	PauseImage               string
+	Snapshotter              string
 	Docker                   bool
 	ContainerRuntimeEndpoint string
 	NoFlannel                bool
@@ -28,7 +31,8 @@ type Agent struct {
 	Rootless                 bool
 	RootlessAlreadyUnshared  bool
 	WithNodeID               bool
-	DisableSELinux           bool
+	EnableSELinux            bool
+	ProtectKernelDefaults    bool
 	AgentShared
 	ExtraKubeletArgs   cli.StringSlice
 	ExtraKubeProxyArgs cli.StringSlice
@@ -57,7 +61,7 @@ var (
 	NodeNameFlag = cli.StringFlag{
 		Name:        "node-name",
 		Usage:       "(agent/node) Node name",
-		EnvVar:      "K3S_NODE_NAME",
+		EnvVar:      version.ProgramUpper + "_NODE_NAME",
 		Destination: &AgentConfig.NodeName,
 	}
 	WithNodeIDFlag = cli.BoolFlag{
@@ -79,13 +83,19 @@ var (
 		Name:        "private-registry",
 		Usage:       "(agent/runtime) Private registry configuration file",
 		Destination: &AgentConfig.PrivateRegistry,
-		Value:       "/etc/rancher/k3s/registries.yaml",
+		Value:       "/etc/rancher/" + version.Program + "/registries.yaml",
 	}
 	PauseImageFlag = cli.StringFlag{
 		Name:        "pause-image",
 		Usage:       "(agent/runtime) Customized pause image for containerd or docker sandbox",
 		Destination: &AgentConfig.PauseImage,
 		Value:       "docker.io/rancher/pause:3.1",
+	}
+	SnapshotterFlag = cli.StringFlag{
+		Name:        "snapshotter",
+		Usage:       "(agent/runtime) Override default containerd snapshotter",
+		Destination: &AgentConfig.Snapshotter,
+		Value:       "overlayfs",
 	}
 	FlannelFlag = cli.BoolFlag{
 		Name:        "no-flannel",
@@ -105,7 +115,7 @@ var (
 	ResolvConfFlag = cli.StringFlag{
 		Name:        "resolv-conf",
 		Usage:       "(agent/networking) Kubelet resolv.conf file",
-		EnvVar:      "K3S_RESOLV_CONF",
+		EnvVar:      version.ProgramUpper + "_RESOLV_CONF",
 		Destination: &AgentConfig.ResolvConf,
 	}
 	ExtraKubeletArgs = cli.StringSliceFlag{
@@ -128,21 +138,45 @@ var (
 		Usage: "(agent/node) Registering and starting kubelet with set of labels",
 		Value: &AgentConfig.Labels,
 	}
-	DisableSELinuxFlag = cli.BoolFlag{
-		Name:        "disable-selinux",
-		Usage:       "(agent/node) Disable SELinux in containerd if currently enabled",
-		Hidden:      true,
-		Destination: &AgentConfig.DisableSELinux,
+	DisableSELinuxFlag = cli.BoolTFlag{
+		Name:   "disable-selinux",
+		Usage:  "(deprecated) Use --selinux to explicitly enable SELinux",
+		Hidden: true,
+	}
+	ProtectKernelDefaultsFlag = cli.BoolFlag{
+		Name:        "protect-kernel-defaults",
+		Usage:       "(agent/node) Kernel tuning behavior. If set, error if kernel tunables are different than kubelet defaults.",
+		Destination: &AgentConfig.ProtectKernelDefaults,
+	}
+	SELinuxFlag = cli.BoolFlag{
+		Name:        "selinux",
+		Usage:       "(agent/node) Enable SELinux in containerd",
+		Hidden:      false,
+		Destination: &AgentConfig.EnableSELinux,
+		EnvVar:      version.ProgramUpper + "_SELINUX",
 	}
 )
 
+func CheckSELinuxFlags(ctx *cli.Context) error {
+	disable, enable := DisableSELinuxFlag.Name, SELinuxFlag.Name
+	switch {
+	case ctx.IsSet(disable) && ctx.IsSet(enable):
+		return errors.Errorf("--%s is deprecated in favor of --%s to affirmatively enable it in containerd", disable, enable)
+	case ctx.IsSet(disable):
+		AgentConfig.EnableSELinux = !ctx.Bool(disable)
+	}
+	return nil
+}
 func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 	return cli.Command{
 		Name:      "agent",
 		Usage:     "Run node agent",
 		UsageText: appName + " agent [OPTIONS]",
+		Before:    SetupDebug(CheckSELinuxFlags),
 		Action:    action,
 		Flags: []cli.Flag{
+			ConfigFlag,
+			DebugFlag,
 			VLevel,
 			VModule,
 			LogFile,
@@ -150,35 +184,35 @@ func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 			cli.StringFlag{
 				Name:        "token,t",
 				Usage:       "(cluster) Token to use for authentication",
-				EnvVar:      "K3S_TOKEN",
+				EnvVar:      version.ProgramUpper + "_TOKEN",
 				Destination: &AgentConfig.Token,
 			},
 			cli.StringFlag{
 				Name:        "token-file",
 				Usage:       "(cluster) Token file to use for authentication",
-				EnvVar:      "K3S_TOKEN_FILE",
+				EnvVar:      version.ProgramUpper + "_TOKEN_FILE",
 				Destination: &AgentConfig.TokenFile,
 			},
 			cli.StringFlag{
 				Name:        "server,s",
 				Usage:       "(cluster) Server to connect to",
-				EnvVar:      "K3S_URL",
+				EnvVar:      version.ProgramUpper + "_URL",
 				Destination: &AgentConfig.ServerURL,
 			},
 			cli.StringFlag{
 				Name:        "data-dir,d",
 				Usage:       "(agent/data) Folder to hold state",
 				Destination: &AgentConfig.DataDir,
-				Value:       "/var/lib/rancher/k3s",
+				Value:       "/var/lib/rancher/" + version.Program + "",
 			},
 			NodeNameFlag,
 			WithNodeIDFlag,
 			NodeLabels,
 			NodeTaints,
 			DockerFlag,
-			DisableSELinuxFlag,
 			CRIEndpointFlag,
 			PauseImageFlag,
+			SnapshotterFlag,
 			PrivateRegistryFlag,
 			NodeIPFlag,
 			NodeExternalIPFlag,
@@ -187,20 +221,23 @@ func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 			FlannelConfFlag,
 			ExtraKubeletArgs,
 			ExtraKubeProxyArgs,
+			ProtectKernelDefaultsFlag,
 			cli.BoolFlag{
 				Name:        "rootless",
 				Usage:       "(experimental) Run rootless",
 				Destination: &AgentConfig.Rootless,
 			},
+			&SELinuxFlag,
 
 			// Deprecated/hidden below
 
+			&DisableSELinuxFlag,
 			FlannelFlag,
 			cli.StringFlag{
 				Name:        "cluster-secret",
 				Usage:       "(deprecated) use --token",
 				Destination: &AgentConfig.ClusterSecret,
-				EnvVar:      "K3S_CLUSTER_SECRET",
+				EnvVar:      version.ProgramUpper + "_CLUSTER_SECRET",
 			},
 		},
 	}

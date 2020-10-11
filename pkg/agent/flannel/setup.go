@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/rancher/k3s/pkg/agent/util"
 	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -81,17 +81,18 @@ func Run(ctx context.Context, nodeConfig *config.Node, nodes v1.NodeInterface) e
 	nodeName := nodeConfig.AgentConfig.NodeName
 
 	for {
-		node, err := nodes.Get(nodeName, metav1.GetOptions{})
+		node, err := nodes.Get(ctx, nodeName, metav1.GetOptions{})
 		if err == nil && node.Spec.PodCIDR != "" {
 			break
 		}
 		if err == nil {
-			logrus.Infof("waiting for node %s CIDR not assigned yet", nodeName)
+			logrus.Info("Waiting for node " + nodeName + " CIDR not assigned yet")
 		} else {
-			logrus.Infof("waiting for node %s: %v", nodeName, err)
+			logrus.Infof("Waiting for node %s: %v", nodeName, err)
 		}
 		time.Sleep(2 * time.Second)
 	}
+	logrus.Info("Node CIDR assigned for: " + nodeName)
 
 	go func() {
 		err := flannel(ctx, nodeConfig.FlannelIface, nodeConfig.FlannelConf, nodeConfig.AgentConfig.KubeConfigKubelet)
@@ -143,11 +144,11 @@ func createFlannelConf(nodeConfig *config.Node) error {
 
 func setupStrongSwan(nodeConfig *config.Node) error {
 	// if data dir env is not set point to root
-	dataDir := os.Getenv("K3S_DATA_DIR")
+	dataDir := os.Getenv(version.ProgramUpper + "_DATA_DIR")
 	if dataDir == "" {
 		dataDir = "/"
 	}
-	dataDir = path.Join(dataDir, "etc", "strongswan")
+	dataDir = filepath.Join(dataDir, "etc", "strongswan")
 
 	info, err := os.Lstat(nodeConfig.AgentConfig.StrongSwanDir)
 	// something exists but is not a symlink, return

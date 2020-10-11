@@ -546,18 +546,7 @@ getshims() {
 killtree $({ set +x; } 2>/dev/null; getshims; set -x)
 
 do_unmount() {
-    { set +x; } 2>/dev/null
-    MOUNTS=
-    while read ignore mount ignore; do
-        MOUNTS="$mount\n$MOUNTS"
-    done </proc/self/mounts
-    MOUNTS=$(printf $MOUNTS | grep "^$1" | sort -r)
-    if [ -n "${MOUNTS}" ]; then
-        set -x
-        umount ${MOUNTS}
-    else
-        set -x
-    fi
+    awk -v path="$1" '$2 ~ ("^" path) { print $2 }' /proc/self/mounts | sort -r | xargs -r -t -n 1 umount
 }
 
 do_unmount '/run/k3s'
@@ -659,7 +648,9 @@ create_systemd_service_file() {
 [Unit]
 Description=Lightweight Kubernetes
 Documentation=https://k3s.io
+After=network-online.target
 Wants=network-online.target
+After=network-online.target
 Conflicts=${conflicts}
 
 [Install]
@@ -670,7 +661,9 @@ Type=${SYSTEMD_TYPE}
 EnvironmentFile=${FILE_K3S_ENV}
 KillMode=process
 Delegate=yes
-LimitNOFILE=infinity
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
 TasksMax=infinity

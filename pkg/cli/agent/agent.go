@@ -4,22 +4,29 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 
+	"github.com/erikdubbelboer/gspt"
 	"github.com/rancher/k3s/pkg/agent"
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	"github.com/rancher/k3s/pkg/datadir"
 	"github.com/rancher/k3s/pkg/netutil"
 	"github.com/rancher/k3s/pkg/token"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/rancher/wrangler/pkg/signals"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
 func Run(ctx *cli.Context) error {
+	// hide process arguments from ps output, since they may contain
+	// database credentials or other secrets.
+	gspt.SetProcTitle(os.Args[0] + " agent")
+
 	if err := cmds.InitLogging(); err != nil {
 		return err
 	}
-	if os.Getuid() != 0 {
+	if os.Getuid() != 0 && runtime.GOOS != "windows" {
 		return fmt.Errorf("agent must be ran as root")
 	}
 
@@ -47,7 +54,7 @@ func Run(ctx *cli.Context) error {
 		cmds.AgentConfig.NodeIP = netutil.GetIPFromInterface(cmds.AgentConfig.FlannelIface)
 	}
 
-	logrus.Infof("Starting k3s agent %s", ctx.App.Version)
+	logrus.Info("Starting " + version.Program + " agent " + ctx.App.Version)
 
 	dataDir, err := datadir.LocalHome(cmds.AgentConfig.DataDir, cmds.AgentConfig.Rootless)
 	if err != nil {

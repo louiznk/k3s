@@ -4,16 +4,17 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	cloudprovider "k8s.io/cloud-provider"
 )
 
-const (
-	InternalIPLabel = "k3s.io/internal-ip"
-	ExternalIPLabel = "k3s.io/external-ip"
-	HostnameLabel   = "k3s.io/hostname"
+var (
+	InternalIPLabel = version.Program + ".io/internal-ip"
+	ExternalIPLabel = version.Program + ".io/external-ip"
+	HostnameLabel   = version.Program + ".io/hostname"
 )
 
 func (k *k3s) AddSSHKeyToAllInstances(ctx context.Context, user string, keyData []byte) error {
@@ -45,7 +46,7 @@ func (k *k3s) InstanceType(ctx context.Context, name types.NodeName) (string, er
 	if err != nil {
 		return "", err
 	}
-	return "k3s", nil
+	return version.Program, nil
 }
 
 func (k *k3s) InstanceTypeByProviderID(ctx context.Context, providerID string) (string, error) {
@@ -62,7 +63,7 @@ func (k *k3s) NodeAddresses(ctx context.Context, name types.NodeName) ([]corev1.
 	if node.Labels[InternalIPLabel] != "" {
 		addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: node.Labels[InternalIPLabel]})
 	} else {
-		logrus.Infof("couldn't find node internal ip label on node %s", name)
+		logrus.Infof("Couldn't find node internal ip label on node %s", name)
 	}
 
 	// check external address
@@ -74,7 +75,7 @@ func (k *k3s) NodeAddresses(ctx context.Context, name types.NodeName) ([]corev1.
 	if node.Labels[HostnameLabel] != "" {
 		addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeHostName, Address: node.Labels[HostnameLabel]})
 	} else {
-		logrus.Infof("couldn't find node hostname label on node %s", name)
+		logrus.Infof("Couldn't find node hostname label on node %s", name)
 	}
 
 	return addresses, nil

@@ -9,38 +9,72 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/labels"
-
 	systemd "github.com/coreos/go-systemd/daemon"
 	"github.com/rancher/k3s/pkg/agent/config"
 	"github.com/rancher/k3s/pkg/agent/containerd"
 	"github.com/rancher/k3s/pkg/agent/flannel"
-	"github.com/rancher/k3s/pkg/agent/loadbalancer"
 	"github.com/rancher/k3s/pkg/agent/netpol"
+	"github.com/rancher/k3s/pkg/agent/proxy"
 	"github.com/rancher/k3s/pkg/agent/syssetup"
 	"github.com/rancher/k3s/pkg/agent/tunnel"
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	"github.com/rancher/k3s/pkg/clientaccess"
 	"github.com/rancher/k3s/pkg/daemons/agent"
 	daemonconfig "github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/datadir"
 	"github.com/rancher/k3s/pkg/nodeconfig"
 	"github.com/rancher/k3s/pkg/rootless"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const (
-	InternalIPLabel = "k3s.io/internal-ip"
-	ExternalIPLabel = "k3s.io/external-ip"
-	HostnameLabel   = "k3s.io/hostname"
+var (
+	InternalIPLabel = version.Program + ".io/internal-ip"
+	ExternalIPLabel = version.Program + ".io/external-ip"
+	HostnameLabel   = version.Program + ".io/hostname"
 )
 
-func run(ctx context.Context, cfg cmds.Agent, lb *loadbalancer.LoadBalancer) error {
-	nodeConfig := config.Get(ctx, cfg)
+const (
+	dockershimSock = "unix:///var/run/dockershim.sock"
+	containerdSock = "unix:///run/k3s/containerd/containerd.sock"
+)
+
+// setupCriCtlConfig creates the crictl config file and populates it
+// with the given data from config.
+func setupCriCtlConfig(cfg cmds.Agent, nodeConfig *daemonconfig.Node) error {
+	cre := nodeConfig.ContainerRuntimeEndpoint
+	if cre == "" {
+		switch {
+		case cfg.Docker:
+			cre = dockershimSock
+		default:
+			cre = containerdSock
+		}
+	}
+
+	agentConfDir := datadir.DefaultDataDir + "/agent/etc"
+	if _, err := os.Stat(agentConfDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(agentConfDir, 0755); err != nil {
+			return err
+		}
+	}
+
+	crp := "runtime-endpoint: " + cre + "\n"
+	return ioutil.WriteFile(agentConfDir+"/crictl.yaml", []byte(crp), 0600)
+}
+
+func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
+	nodeConfig := config.Get(ctx, cfg, proxy)
+
+	if err := setupCriCtlConfig(cfg, nodeConfig); err != nil {
+		return err
+	}
 
 	if !nodeConfig.NoFlannel {
 		if err := flannel.Prepare(ctx, nodeConfig); err != nil {
@@ -54,7 +88,7 @@ func run(ctx context.Context, cfg cmds.Agent, lb *loadbalancer.LoadBalancer) err
 		}
 	}
 
-	if err := tunnel.Setup(ctx, nodeConfig, lb.Update); err != nil {
+	if err := tunnel.Setup(ctx, nodeConfig, proxy); err != nil {
 		return err
 	}
 
@@ -108,18 +142,17 @@ func Run(ctx context.Context, cfg cmds.Agent) error {
 	}
 
 	cfg.DataDir = filepath.Join(cfg.DataDir, "agent")
-	os.MkdirAll(cfg.DataDir, 0700)
+	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
+		return err
+	}
 
-	lb, err := loadbalancer.Setup(ctx, cfg)
+	proxy, err := proxy.NewAPIProxy(!cfg.DisableLoadBalancer, cfg.DataDir, cfg.ServerURL)
 	if err != nil {
 		return err
 	}
-	if lb != nil {
-		cfg.ServerURL = lb.LoadBalancerServerURL()
-	}
 
 	for {
-		newToken, err := clientaccess.NormalizeAndValidateTokenForUser(cfg.ServerURL, cfg.Token, "node")
+		newToken, err := clientaccess.ParseAndValidateTokenForUser(proxy.SupervisorURL(), cfg.Token, "node")
 		if err != nil {
 			logrus.Error(err)
 			select {
@@ -129,12 +162,12 @@ func Run(ctx context.Context, cfg cmds.Agent) error {
 			}
 			continue
 		}
-		cfg.Token = newToken
+		cfg.Token = newToken.String()
 		break
 	}
 
 	systemd.SdNotify(true, "READY=1\n")
-	return run(ctx, cfg, lb)
+	return run(ctx, cfg, proxy)
 }
 
 func validate() error {
@@ -144,7 +177,7 @@ func validate() error {
 	}
 
 	if !strings.Contains(string(cgroups), "cpuset") {
-		logrus.Warn("Failed to find cpuset cgroup, you may need to add \"cgroup_enable=cpuset\" to your linux cmdline (/boot/cmdline.txt on a Raspberry Pi)")
+		logrus.Warn(`Failed to find cpuset cgroup, you may need to add "cgroup_enable=cpuset" to your linux cmdline (/boot/cmdline.txt on a Raspberry Pi)`)
 	}
 
 	if !strings.Contains(string(cgroups), "memory") {
@@ -157,10 +190,14 @@ func validate() error {
 }
 
 func configureNode(ctx context.Context, agentConfig *daemonconfig.Agent, nodes v1.NodeInterface) error {
+	count := 0
 	for {
-		node, err := nodes.Get(agentConfig.NodeName, metav1.GetOptions{})
+		node, err := nodes.Get(ctx, agentConfig.NodeName, metav1.GetOptions{})
 		if err != nil {
-			logrus.Infof("Waiting for kubelet to be ready on node %s: %v", agentConfig.NodeName, err)
+			if count%30 == 0 {
+				logrus.Infof("Waiting for kubelet to be ready on node %s: %v", agentConfig.NodeName, err)
+			}
+			count++
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -182,7 +219,7 @@ func configureNode(ctx context.Context, agentConfig *daemonconfig.Agent, nodes v
 			updateNode = true
 		}
 		if updateNode {
-			if _, err := nodes.Update(node); err != nil {
+			if _, err := nodes.Update(ctx, node, metav1.UpdateOptions{}); err != nil {
 				logrus.Infof("Failed to update node %s: %v", agentConfig.NodeName, err)
 				select {
 				case <-ctx.Done():

@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/natefinch/lumberjack"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/urfave/cli"
 )
 
@@ -43,19 +45,26 @@ var (
 		Usage:       "(logging) Log to standard error as well as file (if set)",
 		Destination: &LogConfig.AlsoLogToStderr,
 	}
+
+	logSetupOnce sync.Once
 )
 
 func InitLogging() error {
-	if LogConfig.LogFile != "" && os.Getenv("_K3S_LOG_REEXEC_") == "" {
-		return runWithLogging()
-	}
+	var rErr error
+	logSetupOnce.Do(func() {
+		if LogConfig.LogFile != "" && os.Getenv("_K3S_LOG_REEXEC_") == "" {
+			rErr = runWithLogging()
+			return
+		}
 
-	if err := checkUnixTimestamp(); err != nil {
-		return err
-	}
+		if err := checkUnixTimestamp(); err != nil {
+			rErr = err
+			return
+		}
 
-	setupLogging()
-	return nil
+		setupLogging()
+	})
+	return rErr
 }
 
 func checkUnixTimestamp() error {
@@ -82,7 +91,7 @@ func runWithLogging() error {
 		l = io.MultiWriter(l, os.Stderr)
 	}
 
-	args := append([]string{"k3s"}, os.Args[1:]...)
+	args := append([]string{version.Program}, os.Args[1:]...)
 	cmd := reexec.Command(args...)
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, "_K3S_LOG_REEXEC_=true")
@@ -95,6 +104,6 @@ func runWithLogging() error {
 func setupLogging() {
 	flag.Set("v", strconv.Itoa(LogConfig.VLevel))
 	flag.Set("vmodule", LogConfig.VModule)
-	flag.Set("alsologtostderr", strconv.FormatBool(debug))
-	flag.Set("logtostderr", strconv.FormatBool(!debug))
+	flag.Set("alsologtostderr", strconv.FormatBool(Debug))
+	flag.Set("logtostderr", strconv.FormatBool(!Debug))
 }

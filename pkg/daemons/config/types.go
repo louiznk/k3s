@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -19,13 +20,14 @@ const (
 	FlannelBackendHostGW    = "host-gw"
 	FlannelBackendIPSEC     = "ipsec"
 	FlannelBackendWireguard = "wireguard"
+	CertificateRenewDays    = 90
 )
 
 type Node struct {
 	Docker                   bool
 	ContainerRuntimeEndpoint string
 	NoFlannel                bool
-	DisableSELinux           bool
+	SELinux                  bool
 	FlannelBackend           string
 	FlannelConf              string
 	FlannelConfOverride      bool
@@ -34,7 +36,6 @@ type Node struct {
 	Images                   string
 	AgentConfig              Agent
 	CACerts                  []byte
-	ServerAddress            string
 	Certificate              *tls.Certificate
 }
 
@@ -46,9 +47,11 @@ type Containerd struct {
 	Config   string
 	Opt      string
 	Template string
+	SELinux  bool
 }
 
 type Agent struct {
+	PodManifests            string
 	NodeName                string
 	NodeConfigPath          string
 	ServingKubeletCert      string
@@ -71,6 +74,7 @@ type Agent struct {
 	ExtraKubeletArgs        []string
 	ExtraKubeProxyArgs      []string
 	PauseImage              string
+	Snapshotter             string
 	CNIPlugin               bool
 	NodeTaints              []string
 	NodeLabels              []string
@@ -79,16 +83,23 @@ type Agent struct {
 	PrivateRegistry         string
 	DisableCCM              bool
 	DisableNPC              bool
+	DisableKubeProxy        bool
 	Rootless                bool
+	ProtectKernelDefaults   bool
 }
 
 type Control struct {
-	AdvertisePort            int
-	AdvertiseIP              string
-	ListenPort               int
-	HTTPSPort                int
-	AgentToken               string
-	Token                    string
+	AdvertisePort int
+	AdvertiseIP   string
+	// The port which kubectl clients can access k8s
+	HTTPSPort int
+	// The port which custom k3s API runs on
+	SupervisorPort int
+	// The port which kube-apiserver runs on
+	APIServerPort            int
+	APIServerBindAddress     string
+	AgentToken               string `json:"-"`
+	Token                    string `json:"-"`
 	ClusterIPRange           *net.IPNet
 	ServiceIPRange           *net.IPNet
 	ClusterDNS               net.IP
@@ -112,9 +123,17 @@ type Control struct {
 	DefaultLocalStoragePath  string
 	DisableCCM               bool
 	DisableNPC               bool
+	DisableKubeProxy         bool
 	ClusterInit              bool
 	ClusterReset             bool
+	ClusterResetRestorePath  string
 	EncryptSecrets           bool
+	TLSMinVersion            uint16
+	TLSCipherSuites          []uint16
+	EtcdDisableSnapshots     bool
+	EtcdSnapshotDir          string
+	EtcdSnapshotCron         string
+	EtcdSnapshotRetention    int
 
 	BindAddress string
 	SANs        []string
@@ -123,6 +142,10 @@ type Control struct {
 }
 
 type ControlRuntimeBootstrap struct {
+	ETCDServerCA       string
+	ETCDServerCAKey    string
+	ETCDPeerCA         string
+	ETCDPeerCAKey      string
 	ServerCA           string
 	ServerCAKey        string
 	ClientCA           string
@@ -138,7 +161,10 @@ type ControlRuntimeBootstrap struct {
 type ControlRuntime struct {
 	ControlRuntimeBootstrap
 
-	HTTPBootstrap bool
+	HTTPBootstrap          bool
+	APIServerReady         <-chan struct{}
+	ETCDReady              <-chan struct{}
+	ClusterControllerStart func(ctx context.Context) error
 
 	ClientKubeAPICert string
 	ClientKubeAPIKey  string
@@ -153,7 +179,6 @@ type ControlRuntime struct {
 	ServingKubeAPICert string
 	ServingKubeAPIKey  string
 	ServingKubeletKey  string
-	ClientToken        string
 	ServerToken        string
 	AgentToken         string
 	Handler            http.Handler
@@ -176,6 +201,13 @@ type ControlRuntime struct {
 	ClientCloudControllerKey  string
 	ClientK3sControllerCert   string
 	ClientK3sControllerKey    string
+
+	ServerETCDCert           string
+	ServerETCDKey            string
+	PeerServerClientETCDCert string
+	PeerServerClientETCDKey  string
+	ClientETCDCert           string
+	ClientETCDKey            string
 
 	Core *core.Factory
 }
